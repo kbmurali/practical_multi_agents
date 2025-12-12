@@ -35,3 +35,6 @@ logs/
 # Vector databases
 chroma/
 pinecone/
+
+chapter3/chroma_store/
+chapter3/chroma_test_store/
