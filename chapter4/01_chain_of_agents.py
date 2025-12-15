@@ -111,33 +111,47 @@ sample_member_policy_docs = [
     ),
 ]
 
+# Extended policy details to make the supervisor routing more interesting.
+# We add deductible and a separate "specialist visit" fee as an extra scenario.
 sample_policy_detail_docs = [
     Document(
         page_content=(
             "Policy ID Policy_abc123_1. "
-            "Doctor visit fee is $100 and Co-Pay is $5. "
-            "Member pays 10% of the doctor visit fee. "
-            "Total amount member pays is the sum of the co-pay and member portion of the doctor visit fee."
+            "Primary care visit fee is $100. Specialist visit fee is $180. "
+            "Co-Pay is $5 for primary care and $20 for specialist. "
+            "Member pays 10% of the visit fee after copay. "
+            "Annual deductible is $250 (applies to specialist visits only). "
+            "Total amount member pays is copay + (member_portion_pct * visit_fee) + deductible_if_applicable."
         ),
         metadata={
             "policy_id": "Policy_abc123_1",
-            "doctor_visit_fee": 100,
-            "copay": 5,
+            "primary_fee": 100,
+            "specialist_fee": 180,
+            "primary_copay": 5,
+            "specialist_copay": 20,
             "member_portion_pct": 0.10,
+            "deductible": 250,
+            "deductible_applies_to": "specialist",
         },
     ),
     Document(
         page_content=(
             "Policy ID Policy_xyz789_1. "
-            "Doctor visit fee is $150 and Co-Pay is $10. "
-            "Member pays 20% of the doctor visit fee. "
-            "Total amount member pays is the sum of the co-pay and member portion of the doctor visit fee."
+            "Primary care visit fee is $150. Specialist visit fee is $220. "
+            "Co-Pay is $10 for primary care and $30 for specialist. "
+            "Member pays 20% of the visit fee after copay. "
+            "Annual deductible is $0. "
+            "Total amount member pays is copay + (member_portion_pct * visit_fee)."
         ),
         metadata={
             "policy_id": "Policy_xyz789_1",
-            "doctor_visit_fee": 150,
-            "copay": 10,
+            "primary_fee": 150,
+            "specialist_fee": 220,
+            "primary_copay": 10,
+            "specialist_copay": 30,
             "member_portion_pct": 0.20,
+            "deductible": 0,
+            "deductible_applies_to": "none",
         },
     ),
 ]
@@ -145,13 +159,13 @@ sample_policy_detail_docs = [
 member_policy_db = Chroma.from_documents(
     documents=sample_member_policy_docs,
     embedding=embeddings,
-    collection_name="member_policy"
+    collection_name="member_policy_supervisor_demo",
 )
 
 policy_details_db = Chroma.from_documents(
     documents=sample_policy_detail_docs,
     embedding=embeddings,
-    collection_name="policy_details"
+    collection_name="policy_details_supervisor_demo",
 )
 
 #%%
@@ -248,11 +262,11 @@ llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o"), max_tokens=2000)
 
 # Agent A: Intake / ID Lookup Agent (A small ReAct agent that only knows member id lookup tool)
 member_id_lookup_agent_prompt = (
-    "You are MemberIDLookupAgent. Your job is ONLY to get user's member id.\n"
-    "You can inspect user's question to extract user's member id.\n"
-    "If member id is not specified, get the member id by invoking the tool.\n"
-    f"If the tool returns a message starting with '{ERROR_PREFIX}', stop and output that error.\n"
-    "Return ONLY the member_id string and nothing else."
+    "You are MemberIDLookupAgent. Your ONLY job is to produce the member_id string.\n"
+    "If member id is present in the user's question, extract it.\n"
+    "Otherwise, call the tool to ask the user.\n"
+    f"If the tool returns a message starting with '{ERROR_PREFIX}', output that error.\n"
+    "Return ONLY the member_id and nothing else."
 )
 
 member_id_lookup_agent = create_react_agent(
@@ -286,10 +300,12 @@ def member_id_lookup_agent_node(state: ChainState, config: RunnableConfig ) -> C
 #%%
 # Agent B: Policy Lookup Agent (A small ReAct agent that only knows policy lookup tool)
 policy_lookup_agent_prompt = (
-    "You are PolicyLookupAgent. Your job is ONLY to get the policy_id for the given member_id.\n"
-    f"If a tool returns a message starting with '{ERROR_PREFIX}', stop and output that error.\n"
-    "Return ONLY the policy_id string and nothing else."
+    "You are PolicyLookupAgent. Your ONLY job is to return the policy_id for the given member_id.\n"
+    "Use the tool provided.\n"
+    f"If the tool returns a message starting with '{ERROR_PREFIX}', output that error.\n"
+    "Return ONLY the policy_id string."
 )
+
 policy_lookup_agent = create_react_agent(
     model=llm,
     tools=[TOOLS["get_member_policy_id"]],
@@ -320,9 +336,10 @@ def policy_lookup_agent_node( state: ChainState, config: RunnableConfig ) -> Cha
 #%%
 # Agent C: Policy Details Retrieval Agent (A small ReAct agent that only knows policy details lookup tool)
 policy_details_agent_prompt = (
-    "You are PolicyDetailsAgent. Your job is ONLY to fetch policy details for a given policy_id.\n"
-    f"If a tool returns a message starting with '{ERROR_PREFIX}', stop and output that error.\n"
-    "Return ONLY the raw policy details text (no extra commentary)."
+    "You are PolicyDetailsAgent. Your ONLY job is to fetch policy details text for a policy_id.\n"
+    "Use the tool provided.\n"
+    f"If the tool returns a message starting with '{ERROR_PREFIX}', output that error.\n"
+    "Return ONLY the raw policy details text."
 )
 
 policy_details_agent = create_react_agent(
@@ -441,7 +458,8 @@ response_summarizer_agent_prompt = (
     "You are a friendly insurance policy assistant.\n"
     "Summarize the following information in easy-to-understand format.\n"
     "Use ONLY the evidence snippets to justify the answer.\n"
-    "If calculation was performed, show the formula and the computed result.\n"
+    "Do not perform any calculations.\n"
+    "If calculations are already pereformed, use their explanations to summarize.\n"
     "If a policy detail is missing, say so and ask what to check next.\n"
 )
 
@@ -608,11 +626,10 @@ invoke_app( thread_id=thread_id, question=question )
 
 #%%
 thread_id_1 = str(uuid.uuid4())
-question_1 = "What would be my total payment for a doctor visit?"
+question_1 = "What would be my total payment for a primary doctor visit?"
 
 invoke_app( thread_id=thread_id_1, question=question_1 )
 # %%
 question_2 = "Can you breakdown how you evaluated the total payment?"
 
 invoke_app( thread_id=thread_id_1, question=question_2 )
-# %%
