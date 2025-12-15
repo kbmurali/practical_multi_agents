@@ -12,6 +12,9 @@ ENV/
 .env
 .env.local
 .env.*.local
+*/.env
+*/.env.local
+*/.env.*.local
 
 # IDE files
 .vscode/
@@ -36,5 +39,5 @@ logs/
 chroma/
 pinecone/
 
-chapter3/chroma_store/
-chapter3/chroma_test_store/
+*/chroma_store/
+*/chroma_test_store/
