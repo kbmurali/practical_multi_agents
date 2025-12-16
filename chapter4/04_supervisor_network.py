@@ -86,23 +86,15 @@ def make_langsmith_config(thread_id: str, ls_default_project: str = "agentic-pat
         tags=[ os.getenv("LANGSMITH_PROJECT", ls_default_project ), "member-service"],
     )
 
-def wrap_tool(t: Tool, empty_schema: bool = False ) -> Tool:
+def wrap_tool( t : Tool ):
     """
-    Make sure any tool errors are returned as a string with ERROR_PREFIX
-    so orchestrator can stop safely.
+    Attach a consistent tool-error handler WITHOUT changing the tool's type.
     """
-    args_schema = {}
-    
-    if not empty_schema:
-        args_schema = t.args_schema
-        
-    return Tool(
-        name=t.name,
-        func=t,
-        description=t.description,
-        args_schema=args_schema,
-        handle_tool_error=lambda e: f"{ERROR_PREFIX} in {t.name}: {e}",
-    )
+    try:
+        t.handle_tool_error = lambda e: f"{ERROR_PREFIX} in {t.name}: {e}"
+    except Exception:
+        pass
+    return t
 
 def _tool_error_guard(text: str) -> Optional[str]:
     return text if text.strip().startswith(ERROR_PREFIX) else None
@@ -195,6 +187,9 @@ def get_member_id() -> str:
     """
     member_id = input("What is your member id? ").strip()
     
+    if not member_id:
+        raise ValueError("Empty member id provided.")
+    
     return member_id
 
 @tool
@@ -223,15 +218,10 @@ def calculator(expression: str) -> str:
     result = numexpr.evaluate(expression.strip(), local_dict=math_constants)
     return str(result)
 
-TOOLS: Dict[str, Tool] = {
-    t.name: wrap_tool(t, empty_schema=empty_schema)
-    for t, empty_schema in [
-        (get_member_id, True),
-        (get_member_policy_id, False),
-        (get_policy_details, False),
-        (calculator, False),
-    ]
-}
+TOOLS: Dict[str, Tool] = { 
+                            t.name : wrap_tool( t ) 
+                            for t in [ get_member_id, get_member_policy_id, get_policy_details, calculator ] 
+                        }
 
 # ---------------------------------------------------------------------------
 # 3) Shared graph state
@@ -669,7 +659,6 @@ invoke_app( thread_id, "What would be my total payment for a primary visit?" )
 # Turn 2: follow-up question on same thread_id (shows how supervisor can re-route)
 invoke_app( thread_id, "Can you break down how you calculated that?" )
 
-# %%
 #%%
 thread_id_2 = str(uuid.uuid4())
 question_2 = "What is my policy id?"

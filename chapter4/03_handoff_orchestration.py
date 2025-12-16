@@ -60,47 +60,38 @@ logging.basicConfig(level=logging.INFO)
 
 ERROR_PREFIX = "TOOL_ERROR"
 
-def make_langsmith_config(thread_id: str, ls_default_project: str = "agentic-patterns" ) -> RunnableConfig:
+def make_langsmith_config(thread_id: str, ls_default_project: str = "agentic-patterns") -> RunnableConfig:
     langsmith_client = Client(
         api_key=os.getenv("LANGSMITH_API_KEY"),
         api_url=os.getenv("LANGSMITH_ENDPOINT"),
     )
     tracer = LangChainTracer(
         client=langsmith_client,
-        project_name=os.getenv("LANGSMITH_PROJECT", ls_default_project ),
+        project_name=os.getenv("LANGSMITH_PROJECT", ls_default_project),
     )
     return RunnableConfig(
         configurable={"thread_id": thread_id},
         callbacks=[tracer],
         metadata={
-            "app": os.getenv("LANGSMITH_PROJECT", ls_default_project ),
+            "app": os.getenv("LANGSMITH_PROJECT", ls_default_project),
             "env": os.getenv("ENV", "demo"),
             "request_id": thread_id,
         },
-        tags=[ os.getenv("LANGSMITH_PROJECT", ls_default_project ), "member-service"],
+        tags=[os.getenv("LANGSMITH_PROJECT", ls_default_project), "member-service"],
     )
 
-def wrap_tool(t: Tool, empty_schema: bool = False ) -> Tool:
+def wrap_tool(t : Tool, empty_schema: bool = False):
     """
-    Make sure any tool errors are returned as a string with ERROR_PREFIX
-    so orchestrator can stop safely.
+    Attach a consistent tool-error handler WITHOUT changing the tool's type.
     """
-    args_schema = {}
-    
-    if not empty_schema:
-        args_schema = t.args_schema
-        
-    return Tool(
-        name=t.name,
-        func=t,
-        description=t.description,
-        args_schema=args_schema,
-        handle_tool_error=lambda e: f"{ERROR_PREFIX} in {t.name}: {e}",
-    )
-    
+    try:
+        t.handle_tool_error = lambda e: f"{ERROR_PREFIX} in {t.name}: {e}"
+    except Exception:
+        pass
+    return t
 
 def _tool_error_guard(text: str) -> Optional[str]:
-    return text if text.strip().startswith(ERROR_PREFIX) else None
+    return text if isinstance(text, str) and text.strip().startswith(ERROR_PREFIX) else None
 
 #%%
 # -----------------------------
@@ -153,13 +144,13 @@ sample_policy_detail_docs = [
 member_policy_db = Chroma.from_documents(
     documents=sample_member_policy_docs,
     embedding=embeddings,
-    collection_name="member_policy"
+    collection_name="member_policy",
 )
 
 policy_details_db = Chroma.from_documents(
     documents=sample_policy_detail_docs,
     embedding=embeddings,
-    collection_name="policy_details"
+    collection_name="policy_details",
 )
 
 #%%
@@ -175,6 +166,9 @@ def get_member_id() -> str:
         str: member id
     """
     member_id = input("What is your member id? ").strip()
+    
+    if not member_id:
+        raise ValueError("Empty member id provided.")
     
     return member_id
 
@@ -210,30 +204,22 @@ def search_policy_knowledge(policy_id: str, query: str) -> List[str]:
     Retrieve the most relevant policy passages for the user's question,
     restricted to the current policy_id.
     """
-    # Chroma supports a metadata filter via 'filter' in many integrations;
-    # In LangChain Chroma, the parameter name is 'filter' for where-clause style.
     docs = policy_details_db.similarity_search(query, k=3, filter={"policy_id": policy_id})
-    
-    results = []
-    
-    for d in docs:
-        results.append( d.page_content )
-        
-    return results
+    return [d.page_content for d in docs]
 
-TOOLS_IDENTITY = [ wrap_tool( get_member_id, True ) ]
+TOOLS_IDENTITY = [wrap_tool(get_member_id, True)]
 TOOLS_POLICY = [
-    wrap_tool( get_member_policy_id, False ),
-    wrap_tool( get_policy_details, False ),
+    wrap_tool(get_member_policy_id, False),
+    wrap_tool(get_policy_details, False),
 ]
-TOOLS_RETRIEVAL = [ wrap_tool( search_policy_knowledge, False ) ]
-TOOLS_MATH = [ wrap_tool( calculator, False ) ]
+TOOLS_RETRIEVAL = [wrap_tool(search_policy_knowledge, False)]
+TOOLS_MATH = [wrap_tool(calculator, False)]
 
 # ----------------------------
 # 3) Handoff State
 # ----------------------------
 class HandoffState(TypedDict, total=False):
-    messages: Annotated[ list[AnyMessage], add_messages ] # HumanMessage / AIMessage
+    messages: Annotated[list[AnyMessage], add_messages]  # HumanMessage / AIMessage
     member_id: Optional[str]
     policy_id: Optional[str]
     policy_details: Optional[str]
@@ -248,6 +234,7 @@ def last_user_text(state: HandoffState) -> str:
     msgs = state.get("messages", [])
     last = next((m for m in reversed(msgs) if isinstance(m, HumanMessage)), None)
     return (last.content or "").strip()
+
 #%%
 # -----------------------------
 # 4) LLM (you can swap model)
@@ -258,13 +245,10 @@ llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o"), max_tokens=2000)
 # -----------------------------
 # 5) Handoff Agents & Graph Nodes
 # -----------------------------
-
 #%%
 # Agent A: Handoff Supervisor (LLM triage) decides next hand-off
 class RouteDecision(BaseModel):
-    next_handoff: Literal["qa", "math", "done"] = Field(
-        description="Which specialist should handle the next step."
-    )
+    next_handoff: Literal["qa", "math", "done"] = Field(description="Which specialist should handle the next step.")
     rationale: str = Field(description="Short reason for this routing decision.")
     needs_calc: bool = Field(description="Whether question needs numeric calculation.")
     needs_retrieval: bool = Field(description="Whether we should retrieve policy passages.")
@@ -284,10 +268,22 @@ Decide routing:
 - Important: Carefully inspect if required amounts and totals involving deductible/copay/coinsurance are already computed.
 """
 
-handoff_sup_agent_promp_template = ChatPromptTemplate.from_messages([
-    SystemMessage( content=handoff_sup_agent_system_message ),
-    MessagesPlaceholder( variable_name="messages" )
-])
+handoff_sup_agent_prompt_template = ChatPromptTemplate.from_messages(
+    [
+        SystemMessage(content=handoff_sup_agent_system_message),
+        SystemMessage(
+            content=(
+                "STATE SNAPSHOT:\n"
+                "member_id={member_id}\n"
+                "policy_id={policy_id}\n"
+                "policy_details={policy_details}\n"
+                "policy_chunks={policy_chunks}\n"
+                "has_error={has_error}\n"
+            )
+        ),
+        MessagesPlaceholder(variable_name="messages"),
+    ]
+)
 
 def handoff_sup_agent_node(state: HandoffState, config: RunnableConfig) -> HandoffState:
     # Hard stops
@@ -301,13 +297,21 @@ def handoff_sup_agent_node(state: HandoffState, config: RunnableConfig) -> Hando
     if not state.get( 'policy_id' ) or not state.get( 'policy_details' ):
         return {"next_handoff": "policy"}
 
-    messages = state.get( 'messages' )
-    
-    supervisor_prompt = handoff_sup_agent_promp_template.invoke( { "messages" : messages } )
-    
-    #Pay attention to function call on llm 'with_structured_output'
-    decision: RouteDecision = llm.with_structured_output(RouteDecision).invoke( supervisor_prompt, config=config )
-    
+    messages = state.get( 'messages', [] )
+
+    supervisor_prompt = handoff_sup_agent_prompt_template.invoke(
+        {
+            "messages": messages,
+            "member_id": state.get( 'member_id' ),
+            "policy_id": state.get( 'policy_id' ),
+            "policy_details": state.get( 'policy_details' ),
+            "policy_chunks": state.get( 'policy_chunks' ),
+            "has_error": bool(state.get( 'error' )),
+        }
+    )
+
+    decision: RouteDecision = llm.with_structured_output(RouteDecision).invoke(supervisor_prompt, config=config)
+
     # If question needs both retrieval and calculation, do retrieval first
     if decision.needs_retrieval and decision.needs_calc:
         nxt = "qa"
@@ -317,11 +321,9 @@ def handoff_sup_agent_node(state: HandoffState, config: RunnableConfig) -> Hando
         nxt = decision.next_handoff
 
     logger.info("Handoff supervisor routing -> %s | %s", nxt, decision.rationale)
-    
-    return { "next_handoff": nxt }
+    return {"next_handoff": nxt}
 
 #%%
-
 # Agent B: ID Lookup Agent (A small ReAct agent that only knows member id lookup tool)
 member_id_lookup_agent_prompt = (
     "You are MemberIDLookupAgent. Your job is ONLY to get user's member id.\n"
@@ -356,12 +358,8 @@ def member_id_lookup_agent_node(state: HandoffState, config: RunnableConfig ) ->
     
     if err:
         return {"error": err}
-
-    msgs = []
-    msgs.append( AIMessage(content=f"Member ID: {text}" ) )
-        
-    return {"member_id": text, "messages": msgs }
-
+    
+    return {"member_id": text}
 #%%
 # Agent C: PolicyAgent: load policy_id + policy details
 def policy_agent_node(state: HandoffState, config: RunnableConfig) -> HandoffState:
@@ -394,50 +392,41 @@ def policy_agent_node(state: HandoffState, config: RunnableConfig) -> HandoffSta
     except Exception as e:
         return { "error": t_details.handle_tool_error( e ) }
 
-    msgs = []
-    
-    msgs.append( AIMessage(content=f"Policy ID: {policy_id}" ) )
-    
-    msgs.append( AIMessage(content=f"Policy Details: {policy_details}" ) )
-    
     return {
         "policy_id": policy_id,
-        "policy_details": policy_details,
-        "messages": msgs
+        "policy_details": policy_details
     }
-    
+
 #%%
-# Agent D: PolicyQAAgent: generic question answering grounded in retrieved passages
+# Agent D: PolicyQAAgent: grounded QA over retrieved passages
 def qa_agent_node(state: HandoffState, config: RunnableConfig) -> HandoffState:
     policy_id = state.get( 'policy_id' )
     
     if not policy_id:
         return state
     
-    msgs = []
-    
     question = last_user_text(state)
     
     policy_details = state.get( 'policy_details' )
     
-    policy_chunks = []
+    policy_chunks: list[str] = []
     
     if state.get( 'policy_chunks' ):
         policy_chunks = state.get( 'policy_chunks' )
     else:
-        #t_retrieve = TOOLS_RETRIEVAL[0]
-        t_retrieve = search_policy_knowledge
-        policy_chunks = t_retrieve.invoke( { "policy_id": policy_id, "query": question } )
+        t_retrieve = TOOLS_RETRIEVAL[0]
+        try:
+            policy_chunks = t_retrieve.invoke({"policy_id": policy_id, "query": question})
+            # Wrapped tools return python objects; only guard if a string error comes back.
+            err = _tool_error_guard(policy_chunks if isinstance(policy_chunks, str) else "")
+            if err:
+                return {"error": err}
+        except Exception as e:
+            return {"error": t_retrieve.handle_tool_error(e)}
 
     # Build grounded context
-    context_blocks = []
-    for i, p in enumerate( policy_chunks, start=1 ):
-        context_blocks.append(f"[Policy Chunk {i}]\n{p}")
+    context_blocks = [f"[Policy Chunk {i}]\n{p}" for i, p in enumerate(policy_chunks, start=1)]
 
-    if not state.get( 'policy_chunks' ):
-        msgs.append( AIMessage( content=f"Policy Chunks: {chr(10).join(context_blocks)}" ))
-        
-        
     prompt = f"""
 You are an insurance policy assistant.
 
@@ -455,35 +444,26 @@ Policy Details (structured facts):
 Retrieved Policy Chunks:
 {chr(10).join(context_blocks)}
 """
+    response = llm.invoke(prompt, config=config).content.strip()
 
-    response = llm.invoke( prompt, config=config ).content.strip()
-
-    msgs.append( AIMessage(content=f"Assistant: {response}" ) )
-    
-    return { "policy_chunks": policy_chunks, "messages": msgs }
+    return { "policy_chunks": policy_chunks, "messages": [AIMessage(content=f"Assistant: {response}")] }
 
 #%%
-# Agent E: MathAgent: generic calculation via LLM -> calculator tool
-# ----------------------------
+# Agent E: MathAgent: LLM plans -> calculator tool executes
 class MathPlan(BaseModel):
     expression: str = Field(description="A pure numeric expression to compute total payment.")
     explanation: str = Field(description="Short explanation of the expression and assumptions.")
     result_units: str = Field(description="Units, usually 'USD'.")
 
-
-def math_agent_node(state: HandoffState, config: RunnableConfig ) -> HandoffState:
+def math_agent_node(state: HandoffState, config: RunnableConfig) -> HandoffState:
     question = last_user_text(state)
     
     policy_details = state.get( 'policy_details', "" )
     
     policy_chunks = state.get( 'policy_chunks', [] )
-    
-    context_blocks = []
-    for i, p in enumerate( policy_chunks, start=1 ):
-        context_blocks.append(f"[Policy Chunk {i}]\n{p}")
 
-    # Ask the LLM to produce a calculation expression from policy facts.
-    # Important: LLM must output an expression that contains only numbers and operators.
+    context_blocks = [f"[Policy Chunk {i}]\n{p}" for i, p in enumerate(policy_chunks, start=1)]
+
     prompt = f"""
 You are a math specialist for insurance cost estimates.
 
@@ -504,63 +484,63 @@ Policy Details (structured facts):
 Retrieved Policy Chunks:
 {chr(10).join(context_blocks)}
 """
-    #Pay attention to function call on llm 'with_structured_output'
-    plan: MathPlan = llm.with_structured_output(MathPlan).invoke( prompt, config=config )
+    plan: MathPlan = llm.with_structured_output(MathPlan).invoke(prompt, config=config)
 
-    result = None
-    
     t_calc = TOOLS_MATH[0]
-    
     try:
         result = t_calc.invoke({"expression": plan.expression})
-        
         err = _tool_error_guard(result)
         if err:
-            return { "error": err }
+            return {"error": err}
     except Exception as e:
-        return { "error": t_calc.handle_tool_error( e ) }
+        return {"error": t_calc.handle_tool_error(e)}
 
     try:
         val = float(result)
     except Exception:
-        return {"error": f"Could not parse calculator result: {result}" }
+        return {"error": f"Could not parse calculator result: {result}"}
 
     answer = (
         f"Calculated Amount: {val:.2f} ({plan.result_units}).\n\n"
         f"How I computed it:\n{plan.explanation}\n\n"
         f"Expression: {plan.expression} = {val:.2f}"
     )
-    
-    msgs = []
-    msgs.append( SystemMessage(content=answer ) )
-    
-    return { "messages": msgs }
 
+    return {"messages": [AIMessage(content=f"[MATH_RESULT]\n{answer}")]}
 #%%
-# Agent F: Response Summarizer Agent (A small ReAct agent that only knows to summarize. No tools.)
+# Agent F: Response Summarizer Agent (no tools)
 response_summarizer_agent_prompt = (
     "You are a friendly insurance policy assistant.\n"
     "Summarize the following information in easy-to-understand format.\n"
     "Use ONLY the evidence snippets to justify the answer.\n"
     "Do not perform any calculations.\n"
-    "If calculations are already pereformed, use their explanations to summarize.\n"
+    "If calculations are already performed, use their explanations to summarize.\n"
     "If a policy detail is missing, say so and ask what to check next.\n"
 )
 
 response_summarizer_agent = create_react_agent(
     model=llm,
     tools=[],
-    prompt=response_summarizer_agent_prompt
+    prompt=response_summarizer_agent_prompt,
 )
 
-def response_summarizer_agent_node( state: HandoffState, config: RunnableConfig ) -> HandoffState:
+def response_summarizer_agent_node(state: HandoffState, config: RunnableConfig) -> HandoffState:
     """
     Produce the final answer grounded in evidence.
     If there's a calc_result, include a short breakdown.
     """
     messages = state.get( 'messages', [] )
-    
-    content = ( f"Member ID: {state.get( 'member_id' )}\n\n" )
+
+    # Always include a concise state header for grounding/debugging.
+    messages.insert(
+        0,
+        SystemMessage(
+            content=(
+                f"STATE:\nmember_id={state.get('member_id')}\n"
+                f"policy_id={state.get('policy_id')}\n"
+            )
+        ),
+    )
     
     if state.get( 'error' ):
         content = f"{state.get( 'error' )}\n"
@@ -569,14 +549,9 @@ def response_summarizer_agent_node( state: HandoffState, config: RunnableConfig 
         
         messages.append( err_message )
 
-    result = response_summarizer_agent.invoke(
-        {"messages": messages },
-        config=config
-    )
-    
+    result = response_summarizer_agent.invoke({"messages": messages}, config=config)
     final_answer = result["messages"][-1].content.strip()
-    
-    return { "answer": final_answer }
+    return {"answer": final_answer}
 
 #%%
 # -----------------------------
@@ -585,46 +560,42 @@ def response_summarizer_agent_node( state: HandoffState, config: RunnableConfig 
 def build_ho_graph():
     g = StateGraph(HandoffState)
 
-    g.add_node( "handoff_supervisor", handoff_sup_agent_node )
-    g.add_node( "identity", member_id_lookup_agent_node )
-    g.add_node( "policy", policy_agent_node )
-    g.add_node( "qa", qa_agent_node )
-    g.add_node( "math", math_agent_node )
-    g.add_node( "done", response_summarizer_agent_node )
+    g.add_node("handoff_supervisor", handoff_sup_agent_node)
+    g.add_node("identity", member_id_lookup_agent_node)
+    g.add_node("policy", policy_agent_node)
+    g.add_node("qa", qa_agent_node)
+    g.add_node("math", math_agent_node)
+    g.add_node("done", response_summarizer_agent_node)
 
-    g.set_entry_point( "handoff_supervisor" )
+    g.set_entry_point("handoff_supervisor")
 
-    def route( state: HandoffState ) -> str:
-        nxt = state.get( 'next_handoff' )
-        
-        if nxt in ( "identity", "policy", "qa", "math", "done" ):
+    def route(state: HandoffState) -> str:
+        nxt = state.get("next_handoff")
+        if nxt in ("identity", "policy", "qa", "math", "done"):
             return nxt
-        
         return "done"
 
     g.add_conditional_edges(
         "handoff_supervisor",
-        
         route,
-        
         {
             "identity": "identity",
             "policy": "policy",
             "qa": "qa",
             "math": "math",
-            "done": "done"
+            "done": "done",
         },
     )
 
     # After specialists, return to handoff_supervisor to decide next hand-off
-    g.add_edge( "identity", "handoff_supervisor" )
-    g.add_edge( "policy", "handoff_supervisor" )
-    g.add_edge( "qa", "handoff_supervisor" )
-    g.add_edge( "math", "handoff_supervisor" )
+    g.add_edge("identity", "handoff_supervisor")
+    g.add_edge("policy", "handoff_supervisor")
+    g.add_edge("qa", "handoff_supervisor")
+    g.add_edge("math", "handoff_supervisor")
     g.add_edge("done", END)
 
-    checkpointer=InMemorySaver()
-    return g.compile( checkpointer=checkpointer )
+    checkpointer = InMemorySaver()
+    return g.compile(checkpointer=checkpointer)
 
 #%%
 # -----------------------------
@@ -634,45 +605,38 @@ app = build_ho_graph()
 
 #%%
 # -----------------------------
-# 8) Invoke COA App
+# 8) Invoke HO App
 # -----------------------------
-def invoke_app( thread_id : str, question: str ):
-    runnable_config = make_langsmith_config( thread_id=thread_id )
-    
-    msgs = []
-    
-    msgs.append( HumanMessage( content=f"User Question: {question}" ) )
-    
-    state: HandoffState = { "messages": msgs }
+def invoke_app(thread_id: str, question: str):
+    runnable_config = make_langsmith_config(thread_id=thread_id)
 
-    final_state = app.invoke(
-        state,
-        config=runnable_config
-    )
+    msgs: list[AnyMessage] = [HumanMessage(content=question)]
+    state: HandoffState = {"messages": msgs}
 
-    if final_state.get( "error" ):
+    final_state = app.invoke(state, config=runnable_config)
+
+    if final_state.get("error"):
         print("\n[FINAL ERROR]")
-        print(final_state.get( 'error' ) )
+        print(final_state.get("error"))
         print("\n")
 
     print("\n[FINAL ANSWER]")
-    print(final_state.get( 'answer', "" ) )
+    print(final_state.get("answer", ""))
     print("\n")
 
 #%%
 thread_id_1 = str(uuid.uuid4())
 question_1 = "What would be my total payment for a doctor visit?"
 
-invoke_app( thread_id=thread_id_1, question=question_1 )
+invoke_app(thread_id=thread_id_1, question=question_1)
+
 # %%
 question_2 = "Can you breakdown how you evaluated the total payment?"
 
-invoke_app( thread_id=thread_id_1, question=question_2 )
+invoke_app(thread_id=thread_id_1, question=question_2)
 
 #%%
 thread_id_2 = str(uuid.uuid4())
 question_2 = "What is my policy id?"
 
-invoke_app( thread_id=thread_id_2, question=question_2 )
-
-# %%
+invoke_app(thread_id=thread_id_2, question=question_2)

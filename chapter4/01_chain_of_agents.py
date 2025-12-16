@@ -73,23 +73,15 @@ def make_langsmith_config(thread_id: str, ls_default_project: str = "agentic-pat
         tags=[ os.getenv("LANGSMITH_PROJECT", ls_default_project ), "member-service"],
     )
 
-def wrap_tool(t: Tool, empty_schema: bool = False ) -> Tool:
+def wrap_tool( t : Tool ):
     """
-    Make sure any tool errors are returned as a string with ERROR_PREFIX
-    so orchestrator can stop safely.
+    Attach a consistent tool-error handler WITHOUT changing the tool's type.
     """
-    args_schema = {}
-    
-    if not empty_schema:
-        args_schema = t.args_schema
-        
-    return Tool(
-        name=t.name,
-        func=t,
-        description=t.description,
-        args_schema=args_schema,
-        handle_tool_error=lambda e: f"{ERROR_PREFIX} in {t.name}: {e}",
-    )
+    try:
+        t.handle_tool_error = lambda e: f"{ERROR_PREFIX} in {t.name}: {e}"
+    except Exception:
+        pass
+    return t
 
 def _tool_error_guard(text: str) -> Optional[str]:
     return text if text.strip().startswith(ERROR_PREFIX) else None
@@ -111,47 +103,33 @@ sample_member_policy_docs = [
     ),
 ]
 
-# Extended policy details to make the supervisor routing more interesting.
-# We add deductible and a separate "specialist visit" fee as an extra scenario.
 sample_policy_detail_docs = [
     Document(
         page_content=(
             "Policy ID Policy_abc123_1. "
-            "Primary care visit fee is $100. Specialist visit fee is $180. "
-            "Co-Pay is $5 for primary care and $20 for specialist. "
-            "Member pays 10% of the visit fee after copay. "
-            "Annual deductible is $250 (applies to specialist visits only). "
-            "Total amount member pays is copay + (member_portion_pct * visit_fee) + deductible_if_applicable."
+            "Doctor visit fee is $100 and Co-Pay is $5. "
+            "Member pays 10% of the doctor visit fee. "
+            "Total amount member pays is the sum of the co-pay and member portion of the doctor visit fee."
         ),
         metadata={
             "policy_id": "Policy_abc123_1",
-            "primary_fee": 100,
-            "specialist_fee": 180,
-            "primary_copay": 5,
-            "specialist_copay": 20,
+            "doctor_visit_fee": 100,
+            "copay": 5,
             "member_portion_pct": 0.10,
-            "deductible": 250,
-            "deductible_applies_to": "specialist",
         },
     ),
     Document(
         page_content=(
             "Policy ID Policy_xyz789_1. "
-            "Primary care visit fee is $150. Specialist visit fee is $220. "
-            "Co-Pay is $10 for primary care and $30 for specialist. "
-            "Member pays 20% of the visit fee after copay. "
-            "Annual deductible is $0. "
-            "Total amount member pays is copay + (member_portion_pct * visit_fee)."
+            "Doctor visit fee is $150 and Co-Pay is $10. "
+            "Member pays 20% of the doctor visit fee. "
+            "Total amount member pays is the sum of the co-pay and member portion of the doctor visit fee."
         ),
         metadata={
             "policy_id": "Policy_xyz789_1",
-            "primary_fee": 150,
-            "specialist_fee": 220,
-            "primary_copay": 10,
-            "specialist_copay": 30,
+            "doctor_visit_fee": 150,
+            "copay": 10,
             "member_portion_pct": 0.20,
-            "deductible": 0,
-            "deductible_applies_to": "none",
         },
     ),
 ]
@@ -159,13 +137,13 @@ sample_policy_detail_docs = [
 member_policy_db = Chroma.from_documents(
     documents=sample_member_policy_docs,
     embedding=embeddings,
-    collection_name="member_policy_supervisor_demo",
+    collection_name="member_policy",
 )
 
 policy_details_db = Chroma.from_documents(
     documents=sample_policy_detail_docs,
     embedding=embeddings,
-    collection_name="policy_details_supervisor_demo",
+    collection_name="policy_details",
 )
 
 #%%
@@ -181,6 +159,9 @@ def get_member_id() -> str:
         str: member id
     """
     member_id = input("What is your member id? ").strip()
+    
+    if not member_id:
+        raise ValueError("Empty member id provided.")
     
     return member_id
 
@@ -211,12 +192,8 @@ def calculator(expression: str) -> str:
     return str(result)
 
 TOOLS: Dict[str, Tool] = { 
-                            t.name : wrap_tool( t, empty_schema=empty_schema ) 
-                            for t, empty_schema in 
-                            [ (get_member_id, True), 
-                              (get_member_policy_id, False),
-                              (get_policy_details, False),
-                              (calculator,False) ] 
+                            t.name : wrap_tool( t ) 
+                            for t in [ get_member_id, get_member_policy_id, get_policy_details, calculator ] 
                         }
 
 #%%
@@ -260,6 +237,7 @@ llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o"), max_tokens=2000)
 # 5) CoA Agents & Graph Nodes
 # -----------------------------
 
+#%%
 # Agent A: Intake / ID Lookup Agent (A small ReAct agent that only knows member id lookup tool)
 member_id_lookup_agent_prompt = (
     "You are MemberIDLookupAgent. Your ONLY job is to produce the member_id string.\n"

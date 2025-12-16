@@ -86,47 +86,33 @@ sample_member_policy_docs = [
     ),
 ]
 
-# Extended policy details to make the supervisor routing more interesting.
-# We add deductible and a separate "specialist visit" fee as an extra scenario.
 sample_policy_detail_docs = [
     Document(
         page_content=(
             "Policy ID Policy_abc123_1. "
-            "Primary care visit fee is $100. Specialist visit fee is $180. "
-            "Co-Pay is $5 for primary care and $20 for specialist. "
-            "Member pays 10% of the visit fee after copay. "
-            "Annual deductible is $250 (applies to specialist visits only). "
-            "Total amount member pays is copay + (member_portion_pct * visit_fee) + deductible_if_applicable."
+            "Doctor visit fee is $100 and Co-Pay is $5. "
+            "Member pays 10% of the doctor visit fee. "
+            "Total amount member pays is the sum of the co-pay and member portion of the doctor visit fee."
         ),
         metadata={
             "policy_id": "Policy_abc123_1",
-            "primary_fee": 100,
-            "specialist_fee": 180,
-            "primary_copay": 5,
-            "specialist_copay": 20,
+            "doctor_visit_fee": 100,
+            "copay": 5,
             "member_portion_pct": 0.10,
-            "deductible": 250,
-            "deductible_applies_to": "specialist",
         },
     ),
     Document(
         page_content=(
             "Policy ID Policy_xyz789_1. "
-            "Primary care visit fee is $150. Specialist visit fee is $220. "
-            "Co-Pay is $10 for primary care and $30 for specialist. "
-            "Member pays 20% of the visit fee after copay. "
-            "Annual deductible is $0. "
-            "Total amount member pays is copay + (member_portion_pct * visit_fee)."
+            "Doctor visit fee is $150 and Co-Pay is $10. "
+            "Member pays 20% of the doctor visit fee. "
+            "Total amount member pays is the sum of the co-pay and member portion of the doctor visit fee."
         ),
         metadata={
             "policy_id": "Policy_xyz789_1",
-            "primary_fee": 150,
-            "specialist_fee": 220,
-            "primary_copay": 10,
-            "specialist_copay": 30,
+            "doctor_visit_fee": 150,
+            "copay": 10,
             "member_portion_pct": 0.20,
-            "deductible": 0,
-            "deductible_applies_to": "none",
         },
     ),
 ]
@@ -134,13 +120,13 @@ sample_policy_detail_docs = [
 member_policy_db = Chroma.from_documents(
     documents=sample_member_policy_docs,
     embedding=embeddings,
-    collection_name="member_policy_supervisor_demo",
+    collection_name="member_policy",
 )
 
 policy_details_db = Chroma.from_documents(
     documents=sample_policy_detail_docs,
     embedding=embeddings,
-    collection_name="policy_details_supervisor_demo",
+    collection_name="policy_details",
 )
 
 #%%
@@ -226,6 +212,9 @@ def extract_member_id(state: ToTState) -> Dict[str, Any]:
 
     print("\n[IntakeAgent] No member_id found. Please enter member id (e.g., abc123, xyz789).")
     member_id = input( "Enter Member ID: " ).strip()
+    
+    if not member_id:
+        raise ValueError("Empty member id provided.")
     
     return {"member_id": member_id }
 
@@ -440,7 +429,7 @@ invoke_app( thread_id=thread_id, question=question )
 
 #%%
 thread_id_1 = str(uuid.uuid4())
-question_1 = "What would be my total payment for a primary doctor visit?"
+question_1 = "What would be my total payment for a doctor visit?"
 
 invoke_app( thread_id=thread_id_1, question=question_1 )
 # %%
