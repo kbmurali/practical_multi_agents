@@ -28,6 +28,7 @@ from langchain_core.tools import tool, Tool
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import InMemorySaver
 
 from langsmith import Client
@@ -68,6 +69,19 @@ def make_langsmith_config(thread_id: str, ls_default_project: str = "agentic-pat
         },
         tags=[ os.getenv("LANGSMITH_PROJECT", ls_default_project ), "member-service"],
     )
+
+def wrap_tool( t : Tool ):
+    """
+    Attach a consistent tool-error handler WITHOUT changing the tool's type.
+    """
+    try:
+        t.handle_tool_error = lambda e: f"{ERROR_PREFIX} in {t.name}: {e}"
+    except Exception:
+        pass
+    return t
+
+def _tool_error_guard(text: str) -> Optional[str]:
+    return text if text.strip().startswith(ERROR_PREFIX) else None
 
 #%%
 # -----------------------------
@@ -134,6 +148,21 @@ policy_details_db = Chroma.from_documents(
 # 2) Tools (Specific agents will use them)
 # -----------------------------
 @tool
+def get_member_id() -> str:
+    """
+    Gets a member id when user's member id is required_summary_
+
+    Returns:
+        str: member id
+    """
+    member_id = input("What is your member id? ").strip()
+    
+    if not member_id:
+        raise ValueError("Empty member id provided.")
+    
+    return member_id
+
+@tool
 def get_member_policy_id(member_id: str) -> str:
     """Retrieve a member's policy_id from the member_policy Chroma store."""
     docs = member_policy_db.similarity_search(member_id, k=1)
@@ -159,6 +188,16 @@ def calculator(expression: str) -> str:
     result = numexpr.evaluate(expression.strip(), local_dict=math_constants)
     return str(result)
 
+TOOLS: Dict[str, Tool] = { 
+                            t.name : wrap_tool( t ) 
+                            for t in [ 
+                                      get_member_id,
+                                      get_member_policy_id,
+                                      get_policy_details,
+                                      calculator 
+                                    ] 
+                        }
+
 #%%
 # -----------------------------
 # 3) Tree-of-Thoughts State
@@ -180,6 +219,7 @@ class ToTState(TypedDict, total=False):
     thoughts: List[Thought]
     chosen_thought: Thought
 
+    error: str
     computed_value: str
     final_answer: str
 
@@ -204,35 +244,85 @@ SYSTEM_PROMPT = SystemMessage(
 # 5) ToT Graph Nodes
 # -----------------------------
 
-# - If member_id missing, it asks the user to provide it via console input.
-#   (You can swap this for your own UI / API / chat frontend.)
-def extract_member_id(state: ToTState) -> Dict[str, Any]:
-    if state.get("member_id"):
-        return {"member_id": state.get("member_id")}
+#%%
+# Agent A: Intake / ID Lookup Agent
+# A small ReAct agent is used even though a Tool only agent could be sufficient 
+# to demonstrate that other full-fledged agents can be integrated.
+member_id_lookup_agent_prompt = (
+    "You are MemberIDLookupAgent. Your ONLY job is to produce the member_id string.\n"
+    "If member id is present in the user's question, extract it.\n"
+    "Otherwise, call the tool to ask the user.\n"
+    f"If the tool returns a message starting with '{ERROR_PREFIX}', output that error.\n"
+    "Return ONLY the member_id and nothing else."
+)
 
-    print("\n[IntakeAgent] No member_id found. Please enter member id (e.g., abc123, xyz789).")
-    member_id = input( "Enter Member ID: " ).strip()
+member_id_lookup_agent = create_react_agent(
+    model=llm,
+    tools=[TOOLS["get_member_id"]],
+    prompt=member_id_lookup_agent_prompt,
+)
+
+def member_id_lookup_agent_node(state: ToTState, config: RunnableConfig ) -> ToTState:
+    if state.get('member_id'):
+        return state
+
+    user_question = state.get( 'user_question' )
     
+    human_message = HumanMessage(content=f"User Question: {user_question}")
+    
+    result = member_id_lookup_agent.invoke(
+        {"messages": [ human_message ]},
+        config=config
+    )
+    
+    text = result["messages"][-1].content.strip()
+
+    err = _tool_error_guard(text)
+    
+    if err:
+        return {**state, "error": err}
+
+    return {**state, "member_id": text}
+
+#%%
+# Policy id look up node - Tool only
+def policy_lookup_node(state: ToTState) -> ToTState:
+    if state.get('policy_id'):
+        return state
+    member_id = state.get('member_id')
     if not member_id:
-        raise ValueError("Empty member id provided.")
-    
-    return {"member_id": member_id }
+        return {**state, "error": "Missing member_id before policy lookup."}
 
-def retrieve_policy_id(state: ToTState) -> Dict[str, Any]:
-    if state.get( 'policy_id' ):
-        return {"policy_id": state.get( 'policy_id' )}
-    
-    policy_id = get_member_policy_id.invoke({"member_id": state.get( 'member_id' )})
-    return {"policy_id": policy_id}
+    try:
+        policy_id = TOOLS["get_member_policy_id"].invoke({"member_id": member_id})
+        err = _tool_error_guard(policy_id)
+        if err:
+            return {**state, "error": err}
+        return {**state, "policy_id": str(policy_id).strip()}
+    except Exception as e:
+        return {**state, "error": f"{ERROR_PREFIX} in get_member_policy_id: {e}"}
 
-def retrieve_policy_details(state: ToTState) -> Dict[str, Any]:
-    if state.get( 'policy_details' ):
-        return {"policy_details": state.get( 'policy_details' )}
-    
-    details = get_policy_details.invoke({"policy_id": state.get( 'policy_id' )})
-    return {"policy_details": details}
+#%%
+# Policy details look up node - Tool only
+def policy_details_node(state: ToTState) -> ToTState[str, Any]:
+    if state.get('policy_details'):
+        return state
+    policy_id = state.get('policy_id')
+    if not policy_id:
+        return {**state, "error": "Missing policy_id before policy details retrieval."}
 
-def generate_thoughts(state: ToTState) -> Dict[str, Any]:
+    try:
+        details = TOOLS["get_policy_details"].invoke({"policy_id": policy_id})
+        err = _tool_error_guard(details)
+        if err:
+            return {**state, "error": err}
+        return {**state, "policy_details": str(details)}
+    except Exception as e:
+        return {**state, "error": f"{ERROR_PREFIX} in get_policy_details: {e}"}
+
+#%%
+# Generate thoughts node - No Tools - LLM only
+def generate_thoughts_node(state: ToTState) -> Dict[str, Any]:
     """
     Create multiple candidate "thoughts" (branches).
     Each thought includes a plan and optionally a math expression.
@@ -263,9 +353,11 @@ def generate_thoughts(state: ToTState) -> Dict[str, Any]:
     for t in thoughts:
         t["score"] = None
 
+    logger.info( f"LLM Generated -------> {len(thoughts)} thoughts to address the user question." )
+    
     return {"thoughts": thoughts}
 
-def evaluate_thoughts(state: ToTState) -> Dict[str, Any]:
+def evaluate_thoughts_node(state: ToTState) -> ToTState:
     """
     Score each thought. Higher score means better alignment with policy + question.
     """
@@ -298,19 +390,21 @@ def evaluate_thoughts(state: ToTState) -> Dict[str, Any]:
 
     return {"thoughts": thoughts}
 
-
-def choose_best_thought(state: ToTState) -> Dict[str, Any]:
+#%%
+# Choose best thought node - Simple impl
+def choose_best_thought_node(state: ToTState) -> ToTState:
     thoughts = state.get( "thoughts" )
     chosen_thought = max(thoughts, key=lambda t: float(t.get("score") or 0.0))
     return {"chosen_thought": chosen_thought}
 
-
-def maybe_compute(state: ToTState) -> Dict[str, Any]:
+#%%
+# Maybe Compute node - Tool only
+def maybe_compute_node(state: ToTState) -> ToTState:
     """
     If the chosen thought includes an expression, compute it.
     We also allow the model to *correct* the expression if needed.
     """
-    chosen_thought = state.get( "chosen_thought" )
+    chosen_thought: Thought = state.get( "chosen_thought" )
     expr = chosen_thought.get("expression")
 
     if not expr:
@@ -334,51 +428,70 @@ def maybe_compute(state: ToTState) -> Dict[str, Any]:
     except Exception:
         pass
 
-    computed_value = calculator.invoke({"expression": expr})
+    computed_value = TOOLS["calculator"].invoke({"expression": expr})
+    err = _tool_error_guard( computed_value if isinstance( computed_value, str ) else "" )
+    if err:
+        return {"error": err}
+        
     return {"computed_value": computed_value, "chosen_thought": {**chosen_thought, "expression": expr}}
 
-
-def compose_answer(state: ToTState) -> Dict[str, Any]:
-    chosen = state.get( "chosen_thought" )
-    computed_value = state.get("computed_value", "")
-
+#%%
+# Final response node - No Tools - LLM only
+def final_response_node(state: ToTState) -> Dict[str, Any]:
     prompt = (
         "Write the final answer to the user. Requirements:\n"
         "- Base strictly on policy details.\n"
         "- Be clear and beginner-friendly.\n"
         "- If you computed a number, show the formula and the result.\n\n"
-        f"User question: {state.get( 'user_question' )}\n"
-        f"Policy details: {state.get( 'policy_details' )}\n"
-        f"Chosen thought: {json.dumps(chosen, indent=2)}\n"
-        f"Computed value (if any): {computed_value}\n"
     )
+    
+    if state.get('error'):
+        prompt += (
+            f"User question: {state.get( 'user_question' )}\n"
+            f"Error:\n{state.get('error')}"
+        )
+    else:
+        chosen = state.get( 'chosen_thought' )
+        computed_value = state.get( 'computed_value', "")
+        
+        prompt += (
+            f"User question: {state.get( 'user_question' )}\n"
+            f"Policy details: {state.get( 'policy_details' )}\n"
+            f"Chosen thought: {json.dumps(chosen, indent=2)}\n"
+            f"Computed value (if any): {computed_value}\n"
+        )
+        
     msg = llm.invoke([SYSTEM_PROMPT, HumanMessage(content=prompt)])
+    
     return {"final_answer": msg.content}
 
 #%%
 # -----------------------------
 # 6) Build the LangGraph ToT workflow
 # -----------------------------
+def stop_if_error(state: ToTState) -> str:
+    return "stop" if state.get('error') else "continue"
+
 def build_tot_graph():
     g = StateGraph(ToTState)
 
-    g.add_node("member_id", extract_member_id)
-    g.add_node("policy_id", retrieve_policy_id)
-    g.add_node("policy_details", retrieve_policy_details)
+    g.add_node("member_id", member_id_lookup_agent_node)
+    g.add_node("policy_id", policy_lookup_node)
+    g.add_node("policy_details", policy_details_node)
 
-    g.add_node("generate_thoughts", generate_thoughts)
-    g.add_node("evaluate_thoughts", evaluate_thoughts)
-    g.add_node("choose_best", choose_best_thought)
-    g.add_node("maybe_compute", maybe_compute)
-    g.add_node("compose_answer", compose_answer)
+    g.add_node("generate_thoughts", generate_thoughts_node)
+    g.add_node("evaluate_thoughts", evaluate_thoughts_node)
+    g.add_node("choose_best", choose_best_thought_node)
+    g.add_node("maybe_compute", maybe_compute_node)
+    g.add_node("compose_answer", final_response_node)
 
     # Linear info retrieval
     g.set_entry_point("member_id")
-    g.add_edge("member_id", "policy_id")
-    g.add_edge("policy_id", "policy_details")
+    g.add_conditional_edges("member_id", stop_if_error, {"stop": "compose_answer", "continue": "policy_id"})
+    g.add_conditional_edges("policy_id", stop_if_error, {"stop": "compose_answer", "continue": "policy_details"})
+    g.add_conditional_edges("policy_details", stop_if_error, {"stop": "compose_answer", "continue": "generate_thoughts"})
 
     # ToT steps
-    g.add_edge("policy_details", "generate_thoughts")
     g.add_edge("generate_thoughts", "evaluate_thoughts")
     g.add_edge("evaluate_thoughts", "choose_best")
     g.add_edge("choose_best", "maybe_compute")
@@ -423,7 +536,7 @@ def invoke_app( thread_id : str, question: str ):
 
 #%%
 thread_id = str(uuid.uuid4())
-question = "What is my policy id?"
+question = "What is my policy id? my member id is abc123"
 
 invoke_app( thread_id=thread_id, question=question )
 

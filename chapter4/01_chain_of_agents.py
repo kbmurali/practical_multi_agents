@@ -22,7 +22,7 @@ import math
 import re
 import uuid
 import logging
-from typing import Dict, Optional, TypedDict
+from typing import Dict, Optional, TypedDict, Literal, Any
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -191,44 +191,62 @@ def calculator(expression: str) -> str:
     result = numexpr.evaluate(expression.strip(), local_dict=math_constants)
     return str(result)
 
+@tool
+def get_policy_metadata(policy_id: str) -> dict:
+    """Retrieve policy metadata from the policy_details Chroma store."""
+    docs = policy_details_db.similarity_search(policy_id, k=1)
+    if not docs or docs[0].metadata.get("policy_id") != policy_id:
+        raise ValueError(f"No policy details found for policy id: {policy_id}")
+    return docs[0].metadata
+
 TOOLS: Dict[str, Tool] = { 
                             t.name : wrap_tool( t ) 
-                            for t in [ get_member_id, get_member_policy_id, get_policy_details, calculator ] 
+                            for t in [ 
+                                      get_member_id,
+                                      get_member_policy_id,
+                                      get_policy_details,
+                                      calculator,
+                                      get_policy_metadata 
+                                    ] 
                         }
 
 #%%
 # -----------------------------
-# 3) Define shared state for the chain
+# 3) Shared State (structured artifacts)
 # -----------------------------
+NextStep = Literal["answer", "calculate", "clarify"]
+
+
 class ChainState(TypedDict, total=False):
     # conversation input
     user_question: str
-    
-    # Extracted / computed state
-    member_id: Optional[str]
 
-    # intermediate artifacts passed agent -> agent
+    # artifacts passed step -> step
+    member_id: Optional[str]
     policy_id: Optional[str]
     policy_details: Optional[str]
 
+    # parsed numeric policy fields (derived from policy_details evidence)
+    doctor_visit_fee: Optional[float]
+    copay: Optional[float]
+    member_portion_pct: Optional[float]
+
     # planning
-    next_step: str
+    next_step: NextStep
     clarification_question: str
     evaluated_answer: str
 
-    # calculation (optional)
-    calc_expression: str
+    # calculation
+    calc_expression: str  # ALWAYS numeric-only by the time it hits calculator
     calc_result: str
 
-    # error message
+    # errors / final
     error: str
-    
-    # final output
     final_answer: str
-    
+
 #%%
 # -----------------------------
-# 4) LLM (you can swap model)
+# 4) LLM
 # -----------------------------
 llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o"), max_tokens=2000)
 
@@ -238,7 +256,9 @@ llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o"), max_tokens=2000)
 # -----------------------------
 
 #%%
-# Agent A: Intake / ID Lookup Agent (A small ReAct agent that only knows member id lookup tool)
+# Agent A: Intake / ID Lookup Agent
+# A small ReAct agent is used even though a Tool only agent could be sufficient 
+# to demonstrate that other full-fledged agents can be integrated.
 member_id_lookup_agent_prompt = (
     "You are MemberIDLookupAgent. Your ONLY job is to produce the member_id string.\n"
     "If member id is present in the user's question, extract it.\n"
@@ -254,7 +274,7 @@ member_id_lookup_agent = create_react_agent(
 )
 
 def member_id_lookup_agent_node(state: ChainState, config: RunnableConfig ) -> ChainState:
-    if state.get("member_id"):
+    if state.get('member_id'):
         return state
 
     user_question = state.get( 'user_question' )
@@ -276,123 +296,139 @@ def member_id_lookup_agent_node(state: ChainState, config: RunnableConfig ) -> C
     return {**state, "member_id": text}
 
 #%%
-# Agent B: Policy Lookup Agent (A small ReAct agent that only knows policy lookup tool)
-policy_lookup_agent_prompt = (
-    "You are PolicyLookupAgent. Your ONLY job is to return the policy_id for the given member_id.\n"
-    "Use the tool provided.\n"
-    f"If the tool returns a message starting with '{ERROR_PREFIX}', output that error.\n"
-    "Return ONLY the policy_id string."
-)
-
-policy_lookup_agent = create_react_agent(
-    model=llm,
-    tools=[TOOLS["get_member_policy_id"]],
-    prompt=policy_lookup_agent_prompt,
-)
-
-def policy_lookup_agent_node( state: ChainState, config: RunnableConfig ) -> ChainState:
-    member_id = state.get("member_id")
+# Agent B (Policy lookup): tool-only, no LLM text-as-artifact
+def policy_lookup_node(state: ChainState, config: RunnableConfig) -> ChainState:
+    if state.get('policy_id'):
+        return state
+    member_id = state.get('member_id')
     if not member_id:
         return {**state, "error": "Missing member_id before policy lookup."}
-    
-    if state.get( 'policy_id' ):
-        return state
 
-    result = policy_lookup_agent.invoke(
-        {"messages": [HumanMessage(content=f"member_id={member_id}. Get the policy_id.")]},
-        config=config
-    )
-    
-    text = result["messages"][-1].content.strip()
-
-    err = _tool_error_guard(text)
-    if err:
-        return {**state, "error": err}
-
-    return {**state, "policy_id": text}
+    try:
+        policy_id = TOOLS["get_member_policy_id"].invoke({"member_id": member_id})
+        err = _tool_error_guard(policy_id)
+        if err:
+            return {**state, "error": err}
+        return {**state, "policy_id": str(policy_id).strip()}
+    except Exception as e:
+        return {**state, "error": f"{ERROR_PREFIX} in get_member_policy_id: {e}"}
 
 #%%
-# Agent C: Policy Details Retrieval Agent (A small ReAct agent that only knows policy details lookup tool)
-policy_details_agent_prompt = (
-    "You are PolicyDetailsAgent. Your ONLY job is to fetch policy details text for a policy_id.\n"
-    "Use the tool provided.\n"
-    f"If the tool returns a message starting with '{ERROR_PREFIX}', output that error.\n"
-    "Return ONLY the raw policy details text."
-)
-
-policy_details_agent = create_react_agent(
-    model=llm,
-    tools=[TOOLS["get_policy_details"]],
-    prompt=policy_details_agent_prompt,
-)
-
-def policy_details_agent_node( state: ChainState, config: RunnableConfig ) -> ChainState:
-    policy_id = state.get("policy_id")
+# Agent C (Policy details): tool-only
+def policy_details_node(state: ChainState, config: RunnableConfig) -> ChainState:
+    if state.get('policy_details'):
+        return state
+    policy_id = state.get('policy_id')
     if not policy_id:
         return {**state, "error": "Missing policy_id before policy details retrieval."}
-    
-    if state.get( 'policy_details' ):
-        return state
 
-    result = policy_details_agent.invoke(
-        {"messages": [HumanMessage(content=f"policy_id={policy_id}. Fetch policy details.")]},
-        config=config
-    )
-    text = result["messages"][-1].content.strip()
-
-    err = _tool_error_guard(text)
-    if err:
-        return {**state, "error": err}
-
-    return {**state, "policy_details": text}
+    try:
+        details = TOOLS["get_policy_details"].invoke({"policy_id": policy_id})
+        err = _tool_error_guard(details)
+        if err:
+            return {**state, "error": err}
+        return {**state, "policy_details": str(details)}
+    except Exception as e:
+        return {**state, "error": f"{ERROR_PREFIX} in get_policy_details: {e}"}
 
 #%%
-# Agent D: Planning Agent
-def planner_agent_node(state: ChainState) -> ChainState:
-    """
-    Decide if we can:
-    - answer directly from policy text,
-    - calculate (need a billed amount or other inputs),
-    - or ask a clarification question.
+# Agent C.1 (Tool Only Evidence parser): extract numeric fields from the policy metadata.
+# This makes downstream planning/calculation reliable and keeps calculator inputs numeric.
+def parse_policy_numbers_node(state: ChainState, config: RunnableConfig) -> ChainState:
+    if state.get('doctor_visit_fee') is not None and state.get('copay') is not None and state.get('member_portion_pct') is not None:
+        return state
 
-    The LLM returns a small JSON object like:
-      {"next_step":"answer"}  OR
-      {"next_step":"calculate", "calc_expression":"25 + 0.2*billed_amount"} OR
-      {"next_step":"clarify", "clarification_question":"can you elaborate your question and retry?"}
+    policy_id = state.get('policy_id')
+    if not policy_id:
+        return {**state, "error": "Missing policy_id before policy numbers retrieval."}
+    
+    out: ChainState = {}
+    
+    try:
+        metadata: dict = TOOLS["get_policy_metadata"].invoke({"policy_id": policy_id})
+        err = _tool_error_guard( metadata if isinstance( metadata, str ) else "" )
+        if err:
+            return {**state, "error": err}
+        
+        out["doctor_visit_fee"] = metadata["doctor_visit_fee"]
+        out["copay"] = metadata["copay"]
+        out["member_portion_pct"] = metadata["member_portion_pct"]
+    except Exception as e:
+        return {**state, "error": f"{ERROR_PREFIX} in get_policy_details: {e}"}
+
+    return {**state, **out}
+
+#%%
+# Agent D (Planner): returns STRICT JSON; routes to answer/calculate/clarify.
+def planner_node(state: ChainState, config: RunnableConfig) -> ChainState:
     """
-    sys = SystemMessage(
+    Decide next_step:
+      - answer: can answer directly from evidence (no math needed)
+      - calculate: compute total payment using parsed fields (numeric expression only)
+      - clarify: missing info (e.g., member id, evidence, or required numbers)
+    """
+
+    # Hard safety: if evidence missing, clarify rather than guess
+    if not state.get('policy_details'):
+        return {
+            **state,
+            "next_step": "clarify",
+            "clarification_question": "I couldn't retrieve your policy details yet. Can you confirm your member id or what you want to check?",
+        }
+
+    system_message = SystemMessage(
         content=(
             "You are a helpful insurance policy assistant.\n"
-            "You MUST only use the provided policy evidence to answer.\n"
-            "If the question requires a number (like billed amount), request it through clarify.\n"
-            "Return ONLY valid JSON with keys:\n"
-            "- next_step: one of 'answer', 'calculate', 'clarify'\n"
-            "- evaluated_answer (only if next_step='answer')\n"
-            "- clarification_question (only if next_step='clarify')\n"
-            "- calc_expression (only if next_step='calculate'): a math expression using numbers and variables like billed_amount (optional)\n"
-            "Important: Do not include currency signs or other non-math signs in a math expression for calculator.\n"
-            "Important: Do not prepend json qualifier to the JSON.\n"
-            "Important: Do not include any extra text."
+            "You MUST only use the provided policy evidence.\n"
+            "Return ONLY valid JSON (no code fences, no extra text).\n"
+            "Schema:\n"
+            "  {\"next_step\": \"answer\"|\"calculate\"|\"clarify\",\n"
+            "   \"evaluated_answer\"?: string,\n"
+            "   \"clarification_question\"?: string,\n"
+            "   \"calc_expression\"?: string }\n"
+            "Rules:\n"
+            "- If the user asks for total payment and the policy provides copay, percentage, and visit fee, choose calculate.\n"
+            "- If required numbers are missing, choose clarify.\n"
+            "- calc_expression MUST be numeric-only (no variable names, no $ signs).\n"
         )
     )
-    human = HumanMessage(
+
+    evidence = state.get('policy_details', "")
+    q = state.get('user_question', "")
+
+    # Provide the model the parsed numeric fields too (still grounded: derived from evidence)
+    parsed_fields = {
+        "doctor_visit_fee": state.get('doctor_visit_fee'),
+        "copay": state.get('copay'),
+        "member_portion_pct": state.get('member_portion_pct'),
+    }
+
+    human_message = HumanMessage(
         content=(
-            f"User question:\n{state.get( 'user_question' )}\n\n"
-            f"Policy evidence:\n{state.get('policy_details','')}\n\n"
+            f"User question:\n{q}\n\n"
+            f"Policy evidence:\n{evidence}\n\n"
+            f"Parsed numeric fields (derived from evidence):\n{json.dumps(parsed_fields)}\n"
         )
     )
-    raw = llm.invoke([sys, human]).content.strip()
 
-    # Parse JSON robustly (strip code fences if present)
+    raw = llm.invoke([system_message, human_message]).content.strip()
     raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.IGNORECASE).strip()
-    try:
-        plan = json.loads(raw)
-    except Exception:
-        # Fallback: if parsing fails, answer directly.
-        plan = {"next_step": "answer", "evaluated_answerr": "I need more details to answer. What additional info can you share?" }
 
-    next_step = plan.get("next_step", "answer")
-    out: ChainState = {**state, "next_step": next_step}
+    try:
+        plan: Dict[str, Any] = json.loads(raw)
+    except Exception:
+        # If planner output can't be parsed, do a safe clarify instead of guessing.
+        return {
+            **state,
+            "next_step": "clarify",
+            "clarification_question": "I couldn't determine the next step from the policy evidence. What exactly are you trying to find (policy id, copay, total payment, etc.)?",
+        }
+
+    next_step = plan.get("next_step")
+    if next_step not in ("answer", "calculate", "clarify"):
+        next_step = "clarify"
+
+    out: ChainState = {**state, "next_step": next_step}  # type: ignore[assignment]
 
     if next_step == "clarify":
         out["clarification_question"] = plan.get(
@@ -401,154 +437,160 @@ def planner_agent_node(state: ChainState) -> ChainState:
         )
         return out
 
-    if next_step == "calculate":
-        out["calc_expression"] = plan.get("calc_expression", "")
+    if next_step == "answer":
+        out["evaluated_answer"] = plan.get(
+            "evaluated_answer",
+            "I can help, but I need a bit more detail about what you want to know.",
+        )
         return out
 
+    # next_step == "calculate"
+    expr = (plan.get("calc_expression") or "").strip()
 
-    # next_step == "answer"
-    out["evaluated_answer"] = plan.get("evaluated_answer", "Check back later!")
-    
+    # Guardrail: if LLM didn't provide expression, build a deterministic one if possible.
+    if not expr:
+        copay = state.get('copay')
+        pct = state.get('member_portion_pct')
+        fee = state.get('doctor_visit_fee')
+        if copay is None or pct is None or fee is None:
+            return {
+                **state,
+                "next_step": "clarify",
+                "clarification_question": "I need the doctor visit fee, copay, and member percentage from your policy to calculate the total. What should I look up next?",
+            }
+        expr = f"{copay} + ({pct} * {fee})"
+
+    # Enforce numeric-only expression (no identifiers)
+    if re.search(r"[A-Za-z_]\w*", expr):
+        return {
+            **state,
+            "next_step": "clarify",
+            "clarification_question": "To calculate, I need numeric values only. What is the billed amount or the missing number referenced in your request?",
+        }
+
+    out["calc_expression"] = expr
     return out
 
 #%%
-# Agent E: Calculator Agent
-def calculator_agent_node(state: ChainState) -> ChainState:
-    """
-    If planner asked to calculate, get the math expression and compute with the calculator tool.
-    """
-    expr = state.get("calc_expression", "").strip()
+# Agent E (Tool Only Calculator): compute numeric expression only
+def calculator_node(state: ChainState, config: RunnableConfig) -> ChainState:
+    expr = (state.get('calc_expression') or "").strip()
+    if not expr:
+        return {**state, "error": f"{ERROR_PREFIX}: Missing calc_expression."}
+
+    try:
+        result = TOOLS["calculator"].invoke({"expression": expr})
+        err = _tool_error_guard(result)
+        if err:
+            return {**state, "error": err}
+        return {**state, "calc_result": str(result)}
+    except Exception as e:
+        return {**state, "error": f"{ERROR_PREFIX} in calculator: {e}"}
     
-    calculator_tool = TOOLS[ 'calculator' ]
-    
-    calc_result = calculator_tool.invoke(expr) if expr else f"{ERROR_PREFIX}: Missing calc_expression."
-    
-    err = _tool_error_guard(calc_result)
-    
-    if err:
-        return {**state, "error": err}
-    
-    return {**state, "calc_result": calc_result }
+#%%
+# Agent F (Clarifier): terminate turn with a clarification question
+def clarification_node(state: ChainState, config: RunnableConfig) -> ChainState:
+    q = state.get('clarification_question') or "What detail can you share so I can answer?"
+    return {**state, "final_answer": q}
 
 #%%
-# Agent F: Response Summarizer Agent (A small ReAct agent that only knows to summarize. No tools.)
-response_summarizer_agent_prompt = (
-    "You are a friendly insurance policy assistant.\n"
-    "Summarize the following information in easy-to-understand format.\n"
-    "Use ONLY the evidence snippets to justify the answer.\n"
-    "Do not perform any calculations.\n"
-    "If calculations are already pereformed, use their explanations to summarize.\n"
-    "If a policy detail is missing, say so and ask what to check next.\n"
-)
-
-response_summarizer_agent = create_react_agent(
-    model=llm,
-    tools=[],
-    prompt=response_summarizer_agent_prompt
-)
-
-def response_summarizer_agent_node( state: ChainState, config: RunnableConfig ) -> ChainState:
-    """
-    Produce the final answer grounded in evidence.
-    If there's a calc_result, include a short breakdown.
-    """
-    content = ( f"Member ID: {state.get( 'member_id' )}\n\n" )
-    
-    if state.get( 'policy_id' ):
-        content = (
-                    f"{content}"
-                    f"Policy ID: {state.get( 'policy_id' )}\n\n" 
-                )
-    
-    if state.get( 'user_question' ):
-        content = (
-                    f"{content}"
-                    f"User Question: {state.get( 'user_question' )}\n\n" 
-                )
-        
-    if state.get( 'policy_details' ):
-        content = (
-                    f"{content}"
-                    f"Policy Evidence:\n{state.get( 'policy_details' )}\n" 
-                )
-    
-    if state.get( 'calc_result' ):
-        content = (
-                    f"{content}"
-                    f"\nCalculation:\n- Expression: {state.get( 'calc_expression' )}\n"
-                    f"- Result: {state.get( 'calc_result' )}\n" 
-                )
-        
-    if state.get( 'clarification_question' ):
-        content = (
-                    f"{content}"
-                    f"- Clarification Question: {state.get( 'clarification_question' )}\n" 
-                )
-    
-    if state.get( 'evaluated_answer' ):
-        content = (
-                    f"{content}"
-                    f"- Evaluated Answer: {state.get( 'evaluated_answer' )}\n" 
-                )
-        
-    if state.get( 'error' ):
-        content = (
-                    f"{content}"
-                    f"{state.get( 'error' )}\n" 
-                )
-
-    human_message = HumanMessage(
-        content=content
+# Agent G (Final response writer): plain LLM call (no ReAct “agent” with empty tools)
+def final_response_node(state: ChainState, config: RunnableConfig) -> ChainState:
+    sys = SystemMessage(
+        content=(
+            "You are a friendly insurance policy assistant.\n"
+            "Use ONLY the policy evidence and computed results already present.\n"
+            "If calc_result is present, explain the breakdown succinctly.\n"
+            "If evaluated_answer is present, return it and cite the evidence contextually.\n"
+            "If there's an error, summarize it and suggest next steps.\n"
+        )
     )
 
-    result = response_summarizer_agent.invoke(
-        {"messages": [ human_message ]},
-        config=config
-    )
+    content_parts = []
     
-    final_answer = result["messages"][-1].content.strip()
+    if state.get('member_id'):
+        content_parts.append(f"Member ID: {state.get('member_id')}")
+        
+    if state.get('policy_id'):
+        content_parts.append(f"Policy ID: {state.get('policy_id')}")
+        
+    if state.get('user_question'):
+        content_parts.append(f"User Question: {state.get('user_question')}")
+        
+    if state.get('policy_details'):
+        content_parts.append(f"Policy Evidence:\n{state.get('policy_details')}")
+        
+    if state.get('calc_result'):
+        content_parts.append(
+            "Calculation:\n"
+            f"- Expression: {state.get('calc_expression')}\n"
+            f"- Result: {state.get('calc_result')}\n"
+        )
+        
+    if state.get('evaluated_answer'):
+        content_parts.append(f"Evaluated Answer Draft:\n{state.get('evaluated_answer')}")
+        
+    if state.get('error'):
+        content_parts.append(f"Error:\n{state.get('error')}")
+
+    human = HumanMessage(content="\n\n".join(content_parts))
+
+    final = llm.invoke([sys, human]).content.strip()
     
-    return {**state, "final_answer": final_answer}
+    return {**state, "final_answer": final}
 
 #%%
 # -----------------------------
-# 6) Build the LangGraph (the “chain”)
+# 6) Build the LangGraph (the chain)
 # -----------------------------
-def should_calculate(state: ChainState) -> str:
-    return "calculate" if state.get("next_step") == "calculate" else "summarize"
+def stop_if_error(state: ChainState) -> str:
+    return "stop" if state.get('error') else "continue"
+
+def route_after_plan(state: ChainState) -> str:
+    step = state.get('next_step')
+    
+    logger.info( "Planner routing -------> %s", step )
+    
+    if step == "calculate":
+        return "calculate"
+    if step == "clarify":
+        return "clarify"
+    
+    return "answer"
 
 def build_coa_graph():
     g = StateGraph(ChainState)
 
+    # Chain-of-Agents nodes (each produces a structured artifact)
     g.add_node("intake", member_id_lookup_agent_node)
-    g.add_node("policy_lookup", policy_lookup_agent_node)
-    g.add_node("policy_details", policy_details_agent_node)
-    g.add_node("plan", planner_agent_node)
-    g.add_node("calculate", calculator_agent_node)
-    g.add_node("summarize", response_summarizer_agent_node)
+    g.add_node("policy_lookup", policy_lookup_node)
+    g.add_node("policy_details", policy_details_node)
+    g.add_node("parse_policy", parse_policy_numbers_node)
+    g.add_node("plan", planner_node)
+    g.add_node("calculate", calculator_node)
+    g.add_node("clarify", clarification_node)
+    g.add_node("final", final_response_node)
 
-    # If error exists after any step, stop early.
-    def stop_if_error(state: ChainState) -> str:
-        return "stop" if state.get("error") else "continue"
-    
-    # Chain order (linear):
+    # Linear chain with early-stop on error
     g.set_entry_point("intake")
-    
-    g.add_conditional_edges( "intake", stop_if_error, {"stop": "summarize", "continue": "policy_lookup"} )
-    
-    g.add_conditional_edges( "policy_lookup", stop_if_error, {"stop": "summarize", "continue": "policy_details"} )
-    
-    g.add_conditional_edges( "policy_details", stop_if_error, {"stop": "summarize", "continue": "plan"} )
-    
-    g.add_conditional_edges( "plan", should_calculate, {"calculate": "calculate", "summarize": "summarize"} )
-    
-    g.add_edge( "calculate", "summarize" )
-    
-    g.add_edge( "summarize", END )
+    g.add_conditional_edges("intake", stop_if_error, {"stop": "final", "continue": "policy_lookup"})
+    g.add_conditional_edges("policy_lookup", stop_if_error, {"stop": "final", "continue": "policy_details"})
+    g.add_conditional_edges("policy_details", stop_if_error, {"stop": "final", "continue": "parse_policy"})
+    g.add_conditional_edges("parse_policy", stop_if_error, {"stop": "final", "continue": "plan"})
 
-    # Memory/checkpointing
+    # Plan routes to calculate / clarify / answer
+    g.add_conditional_edges(
+        "plan", 
+        route_after_plan, 
+        {"calculate": "calculate", "clarify": "clarify", "answer": "final"}
+    )
+    
+    g.add_edge("calculate", "final")
+    g.add_edge("clarify", END)
+    g.add_edge("final", END)
+
     checkpointer = InMemorySaver()
-    return g.compile( checkpointer=checkpointer )
+    return g.compile(checkpointer=checkpointer)
 
 #%%
 # -----------------------------
@@ -560,15 +602,11 @@ app = build_coa_graph()
 # -----------------------------
 # 8) Invoke COA App
 # -----------------------------
-def invoke_app( thread_id : str, question: str ):
-    runnable_config = make_langsmith_config( thread_id=thread_id )
-    
+def invoke_app(thread_id: str, question: str):
+    runnable_config = make_langsmith_config(thread_id=thread_id)
     state: ChainState = {"user_question": question}
 
-    final_state = app.invoke(
-        state,
-        config=runnable_config
-    )
+    final_state = app.invoke(state, config=runnable_config)
 
     if final_state.get("error"):
         print("\n[FINAL ERROR]")
@@ -578,8 +616,7 @@ def invoke_app( thread_id : str, question: str ):
     print("\n[FINAL ANSWER]")
     print(final_state.get("final_answer", ""))
     print("\n")
-        
-    # Optional follow-up: show how the “breakdown” is already captured in state
+
     print("\n" + "=" * 70)
     print("\n[DEBUG STATE]")
     print("\n" + "=" * 70)
@@ -588,11 +625,15 @@ def invoke_app( thread_id : str, question: str ):
         {
             "member_id": final_state.get("member_id"),
             "policy_id": final_state.get("policy_id"),
+            "doctor_visit_fee": final_state.get("doctor_visit_fee"),
+            "copay": final_state.get("copay"),
+            "member_portion_pct": final_state.get("member_portion_pct"),
+            "next_step": final_state.get("next_step"),
             "clarification_question": final_state.get("clarification_question"),
             "evaluated_answer": final_state.get("evaluated_answer"),
             "calc_expression": final_state.get("calc_expression"),
             "calc_result": final_state.get("calc_result"),
-            "error": final_state.get("error")
+            "error": final_state.get("error"),
         }
     )
 
