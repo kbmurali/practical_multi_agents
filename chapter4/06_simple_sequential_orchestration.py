@@ -358,6 +358,7 @@ def query_evaluator_node(state: SharedState, config: RunnableConfig) -> SharedSt
             "  - Create calc_expression based on math involved.\n" 
             "  - calc_expression MUST be numeric-only (no variable names, no $ signs).\n"
             "  - Do not compute yourself but return calc_expression in the json.\n"
+            "  - Provide the evaluated reason for the math expression and return as evaluated_reason in the json.\n"
             "- Else evaluate correct answer to user question and return as evaluated_reason in the json.\n"
             "- Never invent policy details; use policy details.\n\n"
         )
@@ -500,16 +501,16 @@ def invoke_app(thread_id: str, question: str):
     state: SharedState = {"user_question": question}
 
     final_state = app.invoke(state, config=runnable_config)
-
+    
+    print("\n[FINAL ANSWER]")
+    print(final_state.get("final_answer", ""))
+    print("\n")
+    
     if final_state.get("errors"):
         print("\n[FINAL ERRORS]")
         for error in final_state.get( 'errors', [] ):
             print( error )
             print("\n")
-
-    print("\n[FINAL ANSWER]")
-    print(final_state.get("final_answer", ""))
-    print("\n")
 
     print("\n" + "=" * 70)
     print("\n[DEBUG STATE]")
