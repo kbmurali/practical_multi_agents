@@ -26,20 +26,20 @@ from common_utils import get_member_id, get_member_policy_id, get_policy_details
 from common_utils import wrap_tool, _tool_error_guard, ERROR_PREFIX
 
 import os
+import json
 import logging
-from typing import List, Optional, Literal, TypedDict, Annotated
+from typing import Optional, Literal, TypedDict
 
 from pydantic import BaseModel, Field
 
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, AnyMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, SystemMessage, AnyMessage
 from langchain_core.tools import tool
 
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph.message import add_messages
 
 from langchain_core.runnables import RunnableConfig
 
@@ -67,21 +67,16 @@ TOOLS_MATH = [wrap_tool(calculator)]
 # 1) Handoff State
 # ----------------------------
 class HandoffState(TypedDict, total=False):
-    messages: Annotated[list[AnyMessage], add_messages]  # HumanMessage / AIMessage
+    user_question: str
     member_id: Optional[str]
     policy_id: Optional[str]
     policy_details: Optional[str]
-    policy_chunks: Optional[List[str]]
-
+    
     # routing + outputs
-    next_handoff: Optional[Literal["identity", "policy", "qa", "math", "done", "error"]]
+    next_handoff: Optional[Literal["identity", "policy", "math", "summary"]]
     answer: Optional[str]
     error: Optional[str]
-
-def last_user_text(state: HandoffState) -> str:
-    msgs = state.get("messages", [])
-    last = next((m for m in reversed(msgs) if isinstance(m, HumanMessage)), None)
-    return (last.content or "").strip()
+    final_answer: Optional[str]
 
 #%%
 # -----------------------------
@@ -96,10 +91,8 @@ llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o"), max_tokens=2000)
 #%%
 # Agent A: Handoff Supervisor (LLM triage) decides next hand-off
 class RouteDecision(BaseModel):
-    next_handoff: Literal["qa", "math", "done"] = Field(description="Which specialist should handle the next step.")
+    next_handoff: Literal["identity", "policy", "math", "summary"] = Field(description="Which specialist should handle the next step.")
     rationale: str = Field(description="Short reason for this routing decision.")
-    needs_calc: bool = Field(description="Whether question needs numeric calculation.")
-    needs_retrieval: bool = Field(description="Whether we should retrieve policy passages.")
 
 handoff_sup_agent_system_message = """
 You are a supervisor for an insurance assistant that uses hand-offs to specialists.
@@ -108,11 +101,29 @@ Given:
 - user's question
 - available policy details and policy chunks
 
+Specialists:
+- member_id_agent: obtain member_id
+- policy_lookup_agent: obtain policy_id (requires member_id)
+- policy_details_agent: obtain policy_details (requires policy_id)
+- math_agent: Build math expressions from policy_details required to answer user question (requires policy_details)
+- response_summarizer_agent: write a clear final response
+
+Rules:
+1) If error exists -> next_handoff = summary
+2) If member_id missing -> next_handoff = identity
+3) If policy_id missing -> next_handoff = policy
+4) If policy_details missing -> next_handoff = policy
+5) If user asks for cost/total/payment/how much/breakdown -> next = math
+6) Else -> next_handoff = summary
+
+"Important: Do not prepend json qualifier to the JSON.\n"
+
 Decide routing:
-- "qa" for policy/coverage/benefits/explanations, definitions, copay/deductible details, etc.
+- Ensure member id is known.
+- "policy" for policy/coverage/benefits/explanations, definitions, copay/deductible details, etc.
 - "math" for estimated payments, applying deductible/copay/coinsurance, computing totals.
-- If both are needed, choose "qa" first if retrieval is needed, otherwise "math".
-- "done" only if the assistant already has an answer to user question.
+- If both are needed, choose "policy" first if retrieval is needed, otherwise "math".
+- "summary" only if the assistant already has an answer to user question.
 - Important: Carefully inspect if required amounts and totals involving deductible/copay/coinsurance are already computed.
 """
 
@@ -122,52 +133,35 @@ handoff_sup_agent_prompt_template = ChatPromptTemplate.from_messages(
         SystemMessage(
             content=(
                 "STATE SNAPSHOT:\n"
+                "user_question={user_question}\n"
                 "member_id={member_id}\n"
                 "policy_id={policy_id}\n"
                 "policy_details={policy_details}\n"
-                "policy_chunks={policy_chunks}\n"
                 "has_error={has_error}\n"
+                "answer={answer}\n"
             )
-        ),
-        MessagesPlaceholder(variable_name="messages"),
+        )
     ]
 )
 
 def handoff_sup_agent_node(state: HandoffState, config: RunnableConfig) -> HandoffState:
-    # Hard stops
-    if state.get( 'error' ):
-        return { "next_handoff": "done" } 
+    system_message = SystemMessage(content=handoff_sup_agent_system_message)
 
-    # If we don't know member_id or policy, route without LLM
-    if not state.get( 'member_id' ):
-        return {"next_handoff": "identity"}
-    
-    if not state.get( 'policy_id' ) or not state.get( 'policy_details' ):
-        return {"next_handoff": "policy"}
-
-    messages = state.get( 'messages', [] )
-
-    supervisor_prompt = handoff_sup_agent_prompt_template.invoke(
-        {
-            "messages": messages,
+    snapshot = {
+            "user_question": state.get( 'user_question' ),
             "member_id": state.get( 'member_id' ),
             "policy_id": state.get( 'policy_id' ),
             "policy_details": state.get( 'policy_details' ),
-            "policy_chunks": state.get( 'policy_chunks' ),
             "has_error": bool(state.get( 'error' )),
-        }
-    )
+            "answer": state.get( 'answer' ) or "Not evaluated yet.",
+    }
+    
+    human_message = HumanMessage( content=json.dumps( snapshot, indent=2 ))
+    
+    decision: RouteDecision = llm.with_structured_output(RouteDecision).invoke( [system_message, human_message], config=config)
 
-    decision: RouteDecision = llm.with_structured_output(RouteDecision).invoke(supervisor_prompt, config=config)
-
-    # If question needs both retrieval and calculation, do retrieval first
-    if decision.needs_retrieval and decision.needs_calc:
-        nxt = "qa"
-    elif decision.needs_calc:
-        nxt = "math"
-    else:
-        nxt = decision.next_handoff
-
+    nxt = decision.next_handoff
+        
     logger.info("Handoff supervisor routing -> %s | %s", nxt, decision.rationale)
     return {"next_handoff": nxt}
 
@@ -191,7 +185,7 @@ def member_id_lookup_agent_node(state: HandoffState, config: RunnableConfig ) ->
     if state.get( 'member_id' ):
         return state
 
-    user_question = last_user_text(state)
+    user_question = state.get( 'user_question' )
     
     human_message = HumanMessage(content=f"User Question: {user_question}")
     
@@ -214,7 +208,7 @@ def policy_agent_node(state: HandoffState, config: RunnableConfig) -> HandoffSta
     member_id = state.get( 'member_id' )
     
     if not member_id:
-        return state
+        return {**state, "error": "Missing member_id before policy lookup."}
 
     policy_id = None
     
@@ -246,57 +240,6 @@ def policy_agent_node(state: HandoffState, config: RunnableConfig) -> HandoffSta
     }
 
 #%%
-# Agent D: PolicyQAAgent: grounded QA over retrieved passages
-def qa_agent_node(state: HandoffState, config: RunnableConfig) -> HandoffState:
-    policy_id = state.get( 'policy_id' )
-    
-    if not policy_id:
-        return state
-    
-    question = last_user_text(state)
-    
-    policy_details = state.get( 'policy_details' )
-    
-    policy_chunks: list[str] = []
-    
-    if state.get( 'policy_chunks' ):
-        policy_chunks = state.get( 'policy_chunks' )
-    else:
-        t_retrieve = TOOLS_RETRIEVAL[0]
-        try:
-            policy_chunks = t_retrieve.invoke({"policy_id": policy_id, "query": question})
-            # Wrapped tools return python objects; only guard if a string error comes back.
-            err = _tool_error_guard(policy_chunks if isinstance(policy_chunks, str) else "")
-            if err:
-                return {"error": err}
-        except Exception as e:
-            return {"error": t_retrieve.handle_tool_error(e)}
-
-    # Build grounded context
-    context_blocks = [f"[Policy Chunk {i}]\n{p}" for i, p in enumerate(policy_chunks, start=1)]
-
-    prompt = f"""
-You are an insurance policy assistant.
-
-Rules:
-- Answer ONLY using the provided policy details and policy chunks.
-- If the question cannot be answered from them, say what is missing and ask a follow-up.
-- Be concise, but helpful.
-
-User question:
-{question}
-
-Policy Details (structured facts):
-{policy_details}
-
-Retrieved Policy Chunks:
-{chr(10).join(context_blocks)}
-"""
-    response = llm.invoke(prompt, config=config).content.strip()
-
-    return { "policy_chunks": policy_chunks, "messages": [AIMessage(content=f"Assistant: {response}")] }
-
-#%%
 # Agent E: MathAgent: LLM plans -> calculator tool executes
 class MathPlan(BaseModel):
     expression: str = Field(description="A pure numeric expression to compute total payment.")
@@ -304,7 +247,7 @@ class MathPlan(BaseModel):
     result_units: str = Field(description="Units, usually 'USD'.")
 
 def math_agent_node(state: HandoffState, config: RunnableConfig) -> HandoffState:
-    question = last_user_text(state)
+    user_question = state.get( 'user_question' )
     
     policy_details = state.get( 'policy_details', "" )
     
@@ -324,7 +267,7 @@ Goal:
 - Important: Use arithmetic and math operations only.
 
 User question:
-{question}
+{user_question}
 
 Policy Details (structured facts):
 {policy_details}
@@ -354,7 +297,7 @@ Retrieved Policy Chunks:
         f"Expression: {plan.expression} = {val:.2f}"
     )
 
-    return {"messages": [AIMessage(content=f"[MATH_RESULT]\n{answer}")]}
+    return { "answer": answer }
 #%%
 # Agent F: Response Summarizer Agent (no tools)
 response_summarizer_agent_prompt = (
@@ -377,29 +320,25 @@ def response_summarizer_agent_node(state: HandoffState, config: RunnableConfig) 
     Produce the final answer grounded in evidence.
     If there's a calc_result, include a short breakdown.
     """
-    messages = state.get( 'messages', [] )
-
-    # Always include a concise state header for grounding/debugging.
-    messages.insert(
-        0,
-        SystemMessage(
-            content=(
-                f"STATE:\nmember_id={state.get('member_id')}\n"
-                f"policy_id={state.get('policy_id')}\n"
-            )
-        ),
-    )
+    answer = state.get('answer')
     
     if state.get( 'error' ):
-        content = f"{state.get( 'error' )}\n"
+        answer = state.get( 'error' )
         
-        err_message = AIMessage( content=content )
-        
-        messages.append( err_message )
+    messages: list[AnyMessage] = [SystemMessage(
+                    content=(
+                        "STATE:\n"
+                        f"user_question={state.get('user_question')}\n"
+                        f"member_id={state.get('member_id')}\n"
+                        f"policy_id={state.get('policy_id')}\n"
+                        f"policy_details={state.get('policy_details')}\n"
+                        f"response_to_summarize={answer}\n"
+                    )
+                )]
 
     result = response_summarizer_agent.invoke({"messages": messages}, config=config)
     final_answer = result["messages"][-1].content.strip()
-    return {"answer": final_answer}
+    return {"final_answer": final_answer}
 
 #%%
 # -----------------------------
@@ -411,17 +350,16 @@ def build_ho_graph():
     g.add_node("handoff_supervisor", handoff_sup_agent_node)
     g.add_node("identity", member_id_lookup_agent_node)
     g.add_node("policy", policy_agent_node)
-    g.add_node("qa", qa_agent_node)
     g.add_node("math", math_agent_node)
-    g.add_node("done", response_summarizer_agent_node)
+    g.add_node("summary", response_summarizer_agent_node)
 
     g.set_entry_point("handoff_supervisor")
 
     def route(state: HandoffState) -> str:
         nxt = state.get("next_handoff")
-        if nxt in ("identity", "policy", "qa", "math", "done"):
+        if nxt in ("identity", "policy", "math", "summary"):
             return nxt
-        return "done"
+        return "summary"
 
     g.add_conditional_edges(
         "handoff_supervisor",
@@ -429,18 +367,16 @@ def build_ho_graph():
         {
             "identity": "identity",
             "policy": "policy",
-            "qa": "qa",
             "math": "math",
-            "done": "done",
+            "summary": "summary",
         },
     )
 
     # After specialists, return to handoff_supervisor to decide next hand-off
-    g.add_edge("identity", "handoff_supervisor")
+    g.add_edge("identity", "policy")
     g.add_edge("policy", "handoff_supervisor")
-    g.add_edge("qa", "handoff_supervisor")
     g.add_edge("math", "handoff_supervisor")
-    g.add_edge("done", END)
+    g.add_edge("summary", END)
 
     checkpointer = InMemorySaver()
     return g.compile(checkpointer=checkpointer)
