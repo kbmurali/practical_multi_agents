@@ -33,7 +33,8 @@ def build_providers() -> List[Provider]:
         thread_id = str(uuid.uuid4())
         config: RunnableConfig = make_langsmith_config(thread_id=thread_id)
         app = build_magentic_graph()
-        state: MagenticState = {"user_question": question, "member_id": member_id}
+        user_question = f"{question}. Member Id: {member_id}"
+        state: MagenticState = {"user_question": user_question}
         out = app.invoke(state, config=config)
         return out.get("final_answer", "")
 
@@ -94,3 +95,4 @@ thread_id_1 = str(uuid.uuid4())
 question_1 = "What would be my total payment for a primary doctor visit?"
 
 invoke_app( thread_id=thread_id_1, question=question_1 )
+# %%
