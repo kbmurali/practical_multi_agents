@@ -18,8 +18,14 @@ langchain-aws>=0.1.0
 chromadb>=0.4.22
 pinecone-client>=3.0.0
 
+# MySQL
+mysql-connector-python==9.6.0
+
 # Graph Databases
+graphql-core==3.2.5
 neo4j==6.1.0
+neo4j-graphql-py==0.1.4
+ariadne==0.26.2
 
 # Core Dependencies
 pydantic>=2.5.0

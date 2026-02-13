@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS users (
     username VARCHAR(100) UNIQUE NOT NULL,
     email VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
-    role VARCHAR(50) NOT NULL,  -- csr_tier1, csr_tier2, csr_supervisor, csr_readonly
+    role VARCHAR(50) NOT NULL,  -- CSR_TIER1, CSR_TIER2, CSR_SUPERVISOR, CSR_READONLY
     first_name VARCHAR(100),
     last_name VARCHAR(100),
     is_active BOOLEAN DEFAULT TRUE,
@@ -272,24 +272,24 @@ INSERT INTO permissions (permission_id, permission_name, resource_type, action, 
 
 -- CSR Tier 1: Basic read access
 INSERT INTO role_permissions (role, permission_id)
-SELECT 'csr_tier1', permission_id FROM permissions WHERE permission_name IN (
+SELECT 'CSR_TIER1', permission_id FROM permissions WHERE permission_name IN (
     'member_read', 'claim_read', 'pa_read', 'policy_read', 'provider_read'
 );
 
 -- CSR Tier 2: Read + Write + Update
 INSERT INTO role_permissions (role, permission_id)
-SELECT 'csr_tier2', permission_id FROM permissions WHERE permission_name IN (
+SELECT 'CSR_TIER2', permission_id FROM permissions WHERE permission_name IN (
     'member_read', 'member_update', 'claim_read', 'claim_write', 'claim_update',
     'pa_read', 'pa_write', 'pa_update', 'policy_read', 'provider_read'
 );
 
 -- CSR Supervisor: All permissions
 INSERT INTO role_permissions (role, permission_id)
-SELECT 'csr_supervisor', permission_id FROM permissions;
+SELECT 'CSR_SUPERVISOR', permission_id FROM permissions;
 
 -- CSR Read-only: Only read permissions
 INSERT INTO role_permissions (role, permission_id)
-SELECT 'csr_readonly', permission_id FROM permissions WHERE action = 'READ';
+SELECT 'CSR_READONLY', permission_id FROM permissions WHERE action = 'READ';
 
 -- ============================================
 -- Initial Data: Tool Permissions
@@ -298,42 +298,42 @@ SELECT 'csr_readonly', permission_id FROM permissions WHERE action = 'READ';
 -- Define tool permissions for each role
 INSERT INTO tool_permissions (tool_permission_id, role, tool_name, is_allowed, rate_limit_per_minute) VALUES
     -- CSR Tier 1
-    (UUID(), 'csr_tier1', 'member_lookup', TRUE, 30),
-    (UUID(), 'csr_tier1', 'claim_status_lookup', TRUE, 30),
-    (UUID(), 'csr_tier1', 'pa_status_lookup', TRUE, 30),
-    (UUID(), 'csr_tier1', 'provider_search', TRUE, 20),
-    (UUID(), 'csr_tier1', 'eligibility_check', TRUE, 30),
+    (UUID(), 'CSR_TIER1', 'member_lookup', TRUE, 30),
+    (UUID(), 'CSR_TIER1', 'claim_status_lookup', TRUE, 30),
+    (UUID(), 'CSR_TIER1', 'pa_status_lookup', TRUE, 30),
+    (UUID(), 'CSR_TIER1', 'provider_search', TRUE, 20),
+    (UUID(), 'CSR_TIER1', 'eligibility_check', TRUE, 30),
     
     -- CSR Tier 2
-    (UUID(), 'csr_tier2', 'member_lookup', TRUE, 60),
-    (UUID(), 'csr_tier2', 'claim_status_lookup', TRUE, 60),
-    (UUID(), 'csr_tier2', 'claim_create', TRUE, 20),
-    (UUID(), 'csr_tier2', 'claim_update', TRUE, 30),
-    (UUID(), 'csr_tier2', 'pa_status_lookup', TRUE, 60),
-    (UUID(), 'csr_tier2', 'pa_create', TRUE, 20),
-    (UUID(), 'csr_tier2', 'pa_update', TRUE, 30),
-    (UUID(), 'csr_tier2', 'provider_search', TRUE, 40),
-    (UUID(), 'csr_tier2', 'eligibility_check', TRUE, 60),
+    (UUID(), 'CSR_TIER2', 'member_lookup', TRUE, 60),
+    (UUID(), 'CSR_TIER2', 'claim_status_lookup', TRUE, 60),
+    (UUID(), 'CSR_TIER2', 'claim_create', TRUE, 20),
+    (UUID(), 'CSR_TIER2', 'claim_update', TRUE, 30),
+    (UUID(), 'CSR_TIER2', 'pa_status_lookup', TRUE, 60),
+    (UUID(), 'CSR_TIER2', 'pa_create', TRUE, 20),
+    (UUID(), 'CSR_TIER2', 'pa_update', TRUE, 30),
+    (UUID(), 'CSR_TIER2', 'provider_search', TRUE, 40),
+    (UUID(), 'CSR_TIER2', 'eligibility_check', TRUE, 60),
     
     -- CSR Supervisor
-    (UUID(), 'csr_supervisor', 'member_lookup', TRUE, 120),
-    (UUID(), 'csr_supervisor', 'claim_status_lookup', TRUE, 120),
-    (UUID(), 'csr_supervisor', 'claim_create', TRUE, 60),
-    (UUID(), 'csr_supervisor', 'claim_update', TRUE, 60),
-    (UUID(), 'csr_supervisor', 'pa_status_lookup', TRUE, 120),
-    (UUID(), 'csr_supervisor', 'pa_create', TRUE, 60),
-    (UUID(), 'csr_supervisor', 'pa_update', TRUE, 60),
-    (UUID(), 'csr_supervisor', 'provider_search', TRUE, 120),
-    (UUID(), 'csr_supervisor', 'eligibility_check', TRUE, 120),
-    (UUID(), 'csr_supervisor', 'analytics_query', TRUE, 60),
-    (UUID(), 'csr_supervisor', 'report_generation', TRUE, 30),
+    (UUID(), 'CSR_SUPERVISOR', 'member_lookup', TRUE, 120),
+    (UUID(), 'CSR_SUPERVISOR', 'claim_status_lookup', TRUE, 120),
+    (UUID(), 'CSR_SUPERVISOR', 'claim_create', TRUE, 60),
+    (UUID(), 'CSR_SUPERVISOR', 'claim_update', TRUE, 60),
+    (UUID(), 'CSR_SUPERVISOR', 'pa_status_lookup', TRUE, 120),
+    (UUID(), 'CSR_SUPERVISOR', 'pa_create', TRUE, 60),
+    (UUID(), 'CSR_SUPERVISOR', 'pa_update', TRUE, 60),
+    (UUID(), 'CSR_SUPERVISOR', 'provider_search', TRUE, 120),
+    (UUID(), 'CSR_SUPERVISOR', 'eligibility_check', TRUE, 120),
+    (UUID(), 'CSR_SUPERVISOR', 'analytics_query', TRUE, 60),
+    (UUID(), 'CSR_SUPERVISOR', 'report_generation', TRUE, 30),
     
     -- CSR Read-only
-    (UUID(), 'csr_readonly', 'member_lookup', TRUE, 20),
-    (UUID(), 'csr_readonly', 'claim_status_lookup', TRUE, 20),
-    (UUID(), 'csr_readonly', 'pa_status_lookup', TRUE, 20),
-    (UUID(), 'csr_readonly', 'provider_search', TRUE, 20),
-    (UUID(), 'csr_readonly', 'eligibility_check', TRUE, 20);
+    (UUID(), 'CSR_READONLY', 'member_lookup', TRUE, 20),
+    (UUID(), 'CSR_READONLY', 'claim_status_lookup', TRUE, 20),
+    (UUID(), 'CSR_READONLY', 'pa_status_lookup', TRUE, 20),
+    (UUID(), 'CSR_READONLY', 'provider_search', TRUE, 20),
+    (UUID(), 'CSR_READONLY', 'eligibility_check', TRUE, 20);
 
 -- ============================================
 -- Initial Data: LLM Configurations

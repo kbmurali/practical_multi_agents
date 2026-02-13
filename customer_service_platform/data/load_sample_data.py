@@ -16,8 +16,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 # Database imports
 from neo4j import GraphDatabase
 import mysql.connector
-from chromadb import Client as ChromaClient
-from chromadb.config import Settings
+import chromadb
+from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+
+from dotenv import load_dotenv
+from pathlib import Path
+
+dotenv_path = Path(__file__).parent.parent / ".env"
+load_dotenv(dotenv_path=dotenv_path)
 
 
 # Sample data pools (same as generate_sample_data.py)
@@ -64,9 +70,9 @@ class DatabaseLoader:
     
     def __init__(self):
         # Database connection parameters (from Docker Compose)
-        self.neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-        self.neo4j_user = os.getenv("NEO4J_USER", "neo4j")
-        self.neo4j_password = os.getenv("NEO4J_PASSWORD", "healthinsurance")
+        self.neo4j_uri = os.getenv("NEO4J_KG_URI", "bolt://localhost:7687")
+        self.neo4j_user = os.getenv("NEO4J_KG_USER", "neo4j")
+        self.neo4j_password = os.getenv("NEO4J_KG_PASSWORD", "healthinsurance")
         
         self.mysql_host = os.getenv("MYSQL_HOST", "localhost")
         self.mysql_port = int(os.getenv("MYSQL_PORT", "3306"))
@@ -77,9 +83,15 @@ class DatabaseLoader:
         self.chroma_host = os.getenv("CHROMA_HOST", "localhost")
         self.chroma_port = int(os.getenv("CHROMA_PORT", "8000"))
         
+        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+        
+        if not self.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is not set in environment variables")
+        
         self.neo4j_driver = None
         self.mysql_conn = None
         self.chroma_client = None
+        self.openai_ef = None
     
     def connect_databases(self):
         """Connect to all databases"""
@@ -91,9 +103,9 @@ class DatabaseLoader:
                 self.neo4j_uri,
                 auth=(self.neo4j_user, self.neo4j_password)
             )
-            print("✓ Connected to Neo4j")
+            print("-> Connected to Neo4j")
         except Exception as e:
-            print(f"✗ Failed to connect to Neo4j: {e}")
+            print(f"-> Failed to connect to Neo4j: {e}")
             raise
         
         try:
@@ -105,29 +117,37 @@ class DatabaseLoader:
                 password=self.mysql_password,
                 database=self.mysql_database
             )
-            print("✓ Connected to MySQL")
+            print("-> Connected to MySQL")
         except Exception as e:
-            print(f"✗ Failed to connect to MySQL: {e}")
+            print(f"-> Failed to connect to MySQL: {e}")
             raise
         
         try:
             # Connect to Chroma
-            self.chroma_client = ChromaClient(Settings(
-                chroma_api_impl="rest",
-                chroma_server_host=self.chroma_host,
-                chroma_server_http_port=self.chroma_port
-            ))
-            print("✓ Connected to Chroma")
+            self.chroma_client = chromadb.HttpClient(
+                host=self.chroma_host,
+                port=self.chroma_port
+            )
+            
+            # Create OpenAI Embedding
+            self.openai_ef = OpenAIEmbeddingFunction(
+                api_key=self.openai_api_key,
+                model_name="text-embedding-3-small"
+            )
+            
+            print("-> Connected to Chroma and OpenAI Embedding Created")
         except Exception as e:
-            print(f"✗ Failed to connect to Chroma: {e}")
+            print(f"Failed to initiate Chroma requirements: {e}")
             raise
     
     def close_connections(self):
         """Close all database connections"""
         if self.neo4j_driver:
             self.neo4j_driver.close()
+            self.neo4j_driver = None
         if self.mysql_conn:
             self.mysql_conn.close()
+            self.mysql_conn = None
         print("Database connections closed")
     
     def load_neo4j_knowledge_graph(self, data: Dict[str, Any]):
@@ -182,7 +202,7 @@ class DatabaseLoader:
                 session.run("""
                     MATCH (m:Member {memberId: $memberId})
                     MATCH (p:Policy {policyId: $policyId})
-                    CREATE (m)-[:HAS_POLICY]->(p)
+                    CREATE (m)-[:HAS_POLICY]-> (p)
                 """, memberId=policy['memberId'], policyId=policy['policyId'])
             
             # Load Providers
@@ -238,19 +258,19 @@ class DatabaseLoader:
                 session.run("""
                     MATCH (m:Member {memberId: $memberId})
                     MATCH (c:Claim {claimId: $claimId})
-                    CREATE (m)-[:FILED_CLAIM]->(c)
+                    CREATE (m)-[:FILED_CLAIM]-> (c)
                 """, memberId=claim['memberId'], claimId=claim['claimId'])
                 
                 session.run("""
                     MATCH (p:Policy {policyId: $policyId})
                     MATCH (c:Claim {claimId: $claimId})
-                    CREATE (c)-[:UNDER_POLICY]->(p)
+                    CREATE (c)-[:UNDER_POLICY]-> (p)
                 """, policyId=claim['policyId'], claimId=claim['claimId'])
                 
                 session.run("""
                     MATCH (pr:Provider {providerId: $providerId})
                     MATCH (c:Claim {claimId: $claimId})
-                    CREATE (c)-[:SERVICED_BY]->(pr)
+                    CREATE (c)-[:SERVICED_BY]-> (pr)
                 """, providerId=claim['providerId'], claimId=claim['claimId'])
             
             # Load Prior Authorizations
@@ -275,16 +295,16 @@ class DatabaseLoader:
                 session.run("""
                     MATCH (m:Member {memberId: $memberId})
                     MATCH (pa:PriorAuthorization {paId: $paId})
-                    CREATE (m)-[:REQUESTED_PA]->(pa)
+                    CREATE (m)-[:REQUESTED_PA]-> (pa)
                 """, memberId=pa['memberId'], paId=pa['paId'])
                 
                 session.run("""
                     MATCH (pr:Provider {providerId: $providerId})
                     MATCH (pa:PriorAuthorization {paId: $paId})
-                    CREATE (pa)-[:REQUESTED_BY]->(pr)
+                    CREATE (pa)-[:REQUESTED_BY]-> (pr)
                 """, providerId=pa['providerId'], paId=pa['paId'])
             
-            print("✓ Neo4j Knowledge Graph loaded successfully")
+            print("-> Neo4j Knowledge Graph loaded successfully")
     
     def load_mysql_data(self, data: Dict[str, Any]):
         """Load data into MySQL"""
@@ -299,27 +319,27 @@ class DatabaseLoader:
             # Load users (CSRs)
             print("Loading sample CSR users...")
             users = [
-                ('csr1', 'password_hash_1', 'csr1@healthins.com', 'CSR_TIER1', True),
-                ('csr2', 'password_hash_2', 'csr2@healthins.com', 'CSR_TIER2', True),
-                ('supervisor1', 'password_hash_3', 'supervisor@healthins.com', 'SUPERVISOR', True),
+                (str(uuid.uuid4()), 'csr1', 'password_hash_1', 'csr1@healthins.com', 'CSR_TIER1', True),
+                (str(uuid.uuid4()), 'csr2', 'password_hash_2', 'csr2@healthins.com', 'CSR_TIER2', True),
+                (str(uuid.uuid4()), 'supervisor1', 'password_hash_3', 'supervisor@healthins.com', 'CSR_SUPERVISOR', True),
             ]
             
             for user in users:
                 try:
                     cursor.execute("""
-                        INSERT INTO users (username, password_hash, email, role, is_active)
-                        VALUES (%s, %s, %s, %s, %s)
+                        INSERT INTO users (user_id, username, password_hash, email, role, is_active)
+                        VALUES (%s, %s, %s, %s, %s, %s)
                     """, user)
                 except mysql.connector.IntegrityError:
                     pass  # User already exists
             
             self.mysql_conn.commit()
-            print(f"✓ Loaded {len(users)} CSR users")
+            print(f"-> Loaded {len(users)} CSR users")
             
-            print("✓ MySQL data loaded successfully")
+            print("-> MySQL data loaded successfully")
             
         except Exception as e:
-            print(f"✗ Error loading MySQL data: {e}")
+            print(f"-> Error loading MySQL data: {e}")
             self.mysql_conn.rollback()
             raise
         finally:
@@ -331,26 +351,22 @@ class DatabaseLoader:
         
         try:
             # Create or get collections
-            collections = {
-                'policies': self.chroma_client.get_or_create_collection("policies"),
-                'procedures': self.chroma_client.get_or_create_collection("procedures"),
-                'diagnoses': self.chroma_client.get_or_create_collection("diagnoses"),
-                'faqs': self.chroma_client.get_or_create_collection("faqs"),
-                'guidelines': self.chroma_client.get_or_create_collection("clinical_guidelines"),
-                'regulations': self.chroma_client.get_or_create_collection("regulations")
-            }
-            
+            policies_col   = self.chroma_client.get_or_create_collection(name="policies")
+            procedures_col = self.chroma_client.get_or_create_collection(name="procedures")
+            diagnoses_col  = self.chroma_client.get_or_create_collection(name="diagnoses")
+            faqs_col       = self.chroma_client.get_or_create_collection(name="faqs")
+            guidelines_col = self.chroma_client.get_or_create_collection(name="clinical_guidelines")
+
             # Load policy documents
             print(f"Loading {len(data['policies'])} policy documents...")
             policy_docs = []
             policy_ids = []
             policy_metadatas = []
-            
             for policy in data['policies']:
-                doc = f"Policy {policy['policyNumber']}: {policy['planName']} ({policy['planType']}). " \
-                      f"Premium: ${policy['premium']}/month, Deductible: ${policy['deductible']}, " \
-                      f"Out-of-pocket max: ${policy['outOfPocketMax']}. " \
-                      f"Effective: {policy['effectiveDate']} to {policy['expirationDate']}."
+                doc = (f"Policy {policy['policyNumber']}: {policy['planName']} ({policy['planType']}). "
+                    f"Premium: ${policy['premium']}/month, Deductible: ${policy['deductible']}, "
+                    f"Out-of-pocket max: ${policy['outOfPocketMax']}. "
+                    f"Effective: {policy['effectiveDate']} to {policy['expirationDate']}.")
                 policy_docs.append(doc)
                 policy_ids.append(policy['policyId'])
                 policy_metadatas.append({
@@ -358,13 +374,17 @@ class DatabaseLoader:
                     'planType': policy['planType'],
                     'status': policy['status']
                 })
-            
-            collections['policies'].add(
+                
+            embeddings = self.openai_ef(policy_docs)
+            policies_col.add(
                 documents=policy_docs,
+                embeddings=embeddings,
                 ids=policy_ids,
                 metadatas=policy_metadatas
             )
             
+            print(f"-> Loaded {len(policy_docs)} policy documents")
+
             # Load procedure documents
             print(f"Loading {len(data['procedures'])} procedure documents...")
             proc_docs = []
@@ -372,22 +392,26 @@ class DatabaseLoader:
             proc_metadatas = []
             
             for proc in data['procedures']:
-                doc = f"CPT Code {proc['cptCode']}: {proc['description']}. " \
-                      f"Category: {proc['category']}, Average cost: ${proc['averageCost']}. " \
-                      f"{'Requires prior authorization.' if proc['requiresPriorAuth'] else 'No prior authorization required.'}"
+                doc = (f"CPT Code {proc['cptCode']}: {proc['description']}. "
+                    f"Category: {proc['category']}, Average cost: ${proc['averageCost']}. "
+                    f"{'Requires prior authorization.' if proc['requiresPriorAuth'] else 'No prior authorization required.'}")
                 proc_docs.append(doc)
                 proc_ids.append(proc['cptCode'])
                 proc_metadatas.append({
                     'category': proc['category'],
                     'requiresPriorAuth': str(proc['requiresPriorAuth'])
                 })
-            
-            collections['procedures'].add(
+                
+            embeddings = self.openai_ef(proc_docs)
+            procedures_col.add(
                 documents=proc_docs,
+                embeddings=embeddings,
                 ids=proc_ids,
                 metadatas=proc_metadatas
             )
             
+            print(f"-> Loaded {len(proc_docs)} procedure documents")
+
             # Load diagnosis documents
             print(f"Loading {len(data['diagnoses'])} diagnosis documents...")
             diag_docs = []
@@ -395,22 +419,26 @@ class DatabaseLoader:
             diag_metadatas = []
             
             for diag in data['diagnoses']:
-                doc = f"ICD-10 Code {diag['icdCode']}: {diag['description']}. " \
-                      f"Severity: {diag['severity']}, Category: {diag['category']}."
+                doc = (f"ICD-10 Code {diag['icdCode']}: {diag['description']}. "
+                    f"Severity: {diag['severity']}, Category: {diag['category']}.")
                 diag_docs.append(doc)
                 diag_ids.append(diag['icdCode'])
                 diag_metadatas.append({
                     'severity': diag['severity'],
                     'category': diag['category']
                 })
-            
-            collections['diagnoses'].add(
+                
+            embeddings = self.openai_ef(diag_docs)
+            diagnoses_col.add(
                 documents=diag_docs,
+                embeddings=embeddings,
                 ids=diag_ids,
                 metadatas=diag_metadatas
             )
             
-            # Load sample FAQs
+            print(f"-> Loaded {len(diag_docs)} diagnosis documents")
+
+            # Load FAQs
             print("Loading sample FAQs...")
             faqs = [
                 ("How do I check my coverage?", "You can check your coverage by logging into the member portal or calling customer service. Your policy details include covered services, deductibles, and out-of-pocket maximums."),
@@ -420,34 +448,57 @@ class DatabaseLoader:
                 ("How do I find an in-network provider?", "Use our online provider directory or call customer service. In-network providers have contracted rates with your insurance, resulting in lower out-of-pocket costs."),
             ]
             
-            collections['faqs'].add(
-                documents=[f"Q: {q}\nA: {a}" for q, a in faqs],
+            faq_docs = [f"Q: {q}\nA: {a}" for q, a in faqs]
+            
+            embeddings = self.openai_ef(faq_docs)
+            faqs_col.add(
+                documents=faq_docs,
+                embeddings=embeddings,
                 ids=[f"faq_{i}" for i in range(len(faqs))],
                 metadatas=[{'type': 'faq'} for _ in faqs]
             )
             
-            # Load sample clinical guidelines
+            print(f"-> Loaded {len(faq_docs)} FAQ documents")
+
+            # Load clinical guidelines
             print("Loading sample clinical guidelines...")
+            
             guidelines = [
                 ("Knee Arthroscopy Guidelines", "Knee arthroscopy is indicated for diagnostic evaluation and treatment of intra-articular knee pathology. Prior authorization required. Must have failed conservative treatment for 6 weeks including physical therapy and anti-inflammatory medications."),
                 ("Emergency Department Visit Guidelines", "Emergency services are covered for conditions that could result in serious health consequences without immediate care. No prior authorization required. Examples include chest pain, severe bleeding, suspected stroke, or severe breathing difficulty."),
                 ("Preventive Care Guidelines", "Annual wellness visits and preventive screenings are covered at 100% with no cost-sharing when using in-network providers. Includes annual physical, immunizations, cancer screenings, and cardiovascular disease screening."),
             ]
             
-            collections['guidelines'].add(
-                documents=[g[1] for g in guidelines],
+            guideline_docs = [g[1] for g in guidelines]
+            
+            embeddings = self.openai_ef(guideline_docs)
+            guidelines_col.add(
+                documents=guideline_docs,
+                embeddings=embeddings,
                 ids=[f"guideline_{i}" for i in range(len(guidelines))],
                 metadatas=[{'title': g[0], 'type': 'clinical_guideline'} for g in guidelines]
             )
             
-            print("✓ Chroma vector database loaded successfully")
-            
+            print(f"-> Loaded {len(guideline_docs)} guideline documents")
+
+            # Verify collections loaded
+            print("\n-> Chroma collections summary:")
+            print(f"   policies:          {policies_col.count()} documents")
+            print(f"   procedures:        {procedures_col.count()} documents")
+            print(f"   diagnoses:         {diagnoses_col.count()} documents")
+            print(f"   faqs:              {faqs_col.count()} documents")
+            print(f"   clinical_guidelines:{guidelines_col.count()} documents")
+
+            print("-> Chroma vector database loaded successfully")
+
         except Exception as e:
-            print(f"✗ Error loading Chroma data: {e}")
+            print(f"-> Error loading Chroma data: {e}")
+            import traceback
+            traceback.print_exc()
             raise
 
 
-def generate_members(count: int = 50) -> List[Dict[str, Any]]:
+def generate_members(count: int = 50) ->  List[Dict[str, Any]]:
     """Generate member data"""
     members = []
     for i in range(count):
@@ -476,7 +527,7 @@ def generate_members(count: int = 50) -> List[Dict[str, Any]]:
     return members
 
 
-def generate_policies(members: List[Dict], count: int = 60) -> List[Dict[str, Any]]:
+def generate_policies(members: List[Dict], count: int = 60) ->  List[Dict[str, Any]]:
     """Generate policy data"""
     policies = []
     for i in range(count):
@@ -503,7 +554,7 @@ def generate_policies(members: List[Dict], count: int = 60) -> List[Dict[str, An
     return policies
 
 
-def generate_providers(count: int = 30) -> List[Dict[str, Any]]:
+def generate_providers(count: int = 30) ->  List[Dict[str, Any]]:
     """Generate provider data"""
     providers = []
     for i in range(count):
@@ -535,7 +586,7 @@ def generate_providers(count: int = 30) -> List[Dict[str, Any]]:
     return providers
 
 
-def generate_claims(members: List[Dict], policies: List[Dict], providers: List[Dict], count: int = 100) -> List[Dict[str, Any]]:
+def generate_claims(members: List[Dict], policies: List[Dict], providers: List[Dict], count: int = 100) ->  List[Dict[str, Any]]:
     """Generate claim data"""
     claims = []
     for i in range(count):
@@ -578,7 +629,7 @@ def generate_claims(members: List[Dict], policies: List[Dict], providers: List[D
     return claims
 
 
-def generate_prior_authorizations(members: List[Dict], policies: List[Dict], providers: List[Dict], count: int = 50) -> List[Dict[str, Any]]:
+def generate_prior_authorizations(members: List[Dict], policies: List[Dict], providers: List[Dict], count: int = 50) ->  List[Dict[str, Any]]:
     """Generate prior authorization data"""
     pas = []
     for i in range(count):
@@ -628,19 +679,19 @@ def main():
     # Generate sample data
     print("\n=== Generating Sample Data ===")
     members = generate_members(50)
-    print(f"✓ Generated {len(members)} members")
+    print(f"-> Generated {len(members)} members")
     
     policies = generate_policies(members, 60)
-    print(f"✓ Generated {len(policies)} policies")
+    print(f"-> Generated {len(policies)} policies")
     
     providers = generate_providers(30)
-    print(f"✓ Generated {len(providers)} providers")
+    print(f"-> Generated {len(providers)} providers")
     
     claims = generate_claims(members, policies, providers, 100)
-    print(f"✓ Generated {len(claims)} claims")
+    print(f"-> Generated {len(claims)} claims")
     
     pas = generate_prior_authorizations(members, policies, providers, 50)
-    print(f"✓ Generated {len(pas)} prior authorizations")
+    print(f"-> Generated {len(pas)} prior authorizations")
     
     # Prepare complete dataset
     data = {
@@ -656,7 +707,7 @@ def main():
     # Save to JSON for reference
     with open("sample_data.json", "w") as f:
         json.dump(data, f, indent=2)
-    print(f"✓ Saved sample data to sample_data.json")
+    print(f"-> Saved sample data to sample_data.json")
     
     # Load into databases
     loader = DatabaseLoader()
@@ -669,7 +720,7 @@ def main():
         loader.load_chroma_vectors(data)
         
         print("\n" + "=" * 60)
-        print("✓ ALL DATA LOADED SUCCESSFULLY!")
+        print("-> ALL DATA LOADED SUCCESSFULLY!")
         print("=" * 60)
         print(f"\nTotal records loaded:")
         print(f"  - Members: {len(members)}")
@@ -680,7 +731,7 @@ def main():
         print(f"  - Total: {len(members) + len(policies) + len(providers) + len(claims) + len(pas)}")
         
     except Exception as e:
-        print(f"\n✗ Error loading data: {e}")
+        print(f"\n-> Error loading data: {e}")
         import traceback
         traceback.print_exc()
         return 1
