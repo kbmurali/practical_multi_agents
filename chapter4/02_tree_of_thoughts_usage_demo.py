@@ -50,3 +50,4 @@ invoke_app( thread_id=thread_id_1, question=question_1 )
 question_2 = "Can you breakdown how you evaluated the total payment?"
 
 invoke_app( thread_id=thread_id_1, question=question_2 )
+# %%

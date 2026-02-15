@@ -1,22 +1,27 @@
-# Core LangChain and LangGraph
-langchain>=0.1.0
-langchain-community>=0.0.20
-langgraph>=0.0.26
-langgraph-checkpoint==2.1.1
-langgraph-prebuilt==0.6.2
-langgraph-sdk==0.2.0
-langsmith>=0.4.10
-langchain-experimental>=0.0.50
+# Core LangChain stack — pinned to a coherent 0.3.x set
+langchain==0.3.25
+langchain-core==0.3.59
+langchain-community==0.3.19
+langsmith==0.1.147
+
+# LangGraph stack — 0.4.x series (compatible with langchain-core 0.3.x)
+langgraph==0.4.3
+langgraph-checkpoint==2.0.25
+langgraph-prebuilt==0.1.8
+langgraph-sdk==0.1.66
+
+# LangChain experimental and adapters
+langchain-experimental==0.3.4
 langchain-mcp-adapters==0.1.14
 
 # LLM Providers
-langchain-openai>=0.0.8
-langchain-anthropic>=0.1.0
-langchain-aws>=0.1.0
+langchain-openai==0.2.3
+langchain-anthropic==0.3.7
+langchain-aws==0.2.10
 
 # Vector Databases
-chromadb>=0.4.22
-pinecone-client>=3.0.0
+chromadb==1.3.6
+pinecone-client==6.0.0
 
 # MySQL
 mysql-connector-python==9.6.0
@@ -24,8 +29,6 @@ mysql-connector-python==9.6.0
 # Graph Databases
 graphql-core==3.2.5
 neo4j==6.1.0
-neo4j-graphql-py==0.1.4
-ariadne==0.26.2
 
 # Core Dependencies
 pydantic>=2.5.0
@@ -36,7 +39,7 @@ mcp>=1.22.0
 
 # Data Processing
 pandas>=2.1.0
-numpy>=1.24.0
+numpy==1.26.4
 numexpr>=2.11.0
 
 # Development and Testing
@@ -47,6 +50,20 @@ flake8>=6.0.0
 mypy>=1.7.0
 pysqlite3-binary>=0.5.4
 
-# Jupyter for Interactive Development
-jupyter>=1.0.0
-ipykernel>=6.25.0
+
+nest_asyncio>=1.5.0
+
+# Security Controls - Authentication
+python-jose[cryptography]==3.5.0
+passlib[bcrypt]==1.7.4
+
+# Control 1: Prompt Injection Defense
+nemoguardrails==0.11.0
+
+# Control 8: Output Validation & Sanitization
+guardrails-ai==0.5.13
+
+# Database Drivers
+clickhouse-driver==0.2.7
+psycopg2-binary==2.9.9
+redis==5.2.1

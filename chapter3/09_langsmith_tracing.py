@@ -5,7 +5,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool, Tool
 from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
-from dotenv import load_dotenv
+
 import numexpr
 import math
 import os
@@ -23,7 +23,10 @@ from langchain_core.tracers import LangChainTracer
 # --- new imports for Logging ---
 import logging
 
-load_dotenv()
+from dotenv import load_dotenv, find_dotenv
+
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 #%%
 # Embeddings for Chroma
@@ -299,9 +302,6 @@ thread_config = RunnableConfig(
     metadata={ 
                 "app": os.getenv("LANGSMITH_PROJECT", "langchain-primer-demo"), 
                 "env": "demo",
-                
-                #Share the same logger with the Agent
-                "logger" : logger,
                 
                 #Same trace id for conversational memory, LangSmith tracing, and other Logging
                 "request_id" : trace_id 

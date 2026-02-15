@@ -7,9 +7,10 @@ from langgraph.graph import StateGraph, START, END, MessagesState
 import numexpr
 import math
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 #%%
 def get_member_id() -> str:

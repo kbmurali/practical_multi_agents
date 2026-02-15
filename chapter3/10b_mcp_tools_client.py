@@ -11,12 +11,14 @@ from langsmith import Client
 from langchain_core.tracers import LangChainTracer
 from langchain_core.runnables import RunnableConfig
 
-from dotenv import load_dotenv
 import numexpr
 import math
 import os
 
-load_dotenv()
+from dotenv import load_dotenv, find_dotenv
+
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 #%%
 mcp_client = MultiServerMCPClient(

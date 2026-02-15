@@ -1,8 +1,7 @@
 #%%
 from neo4j import GraphDatabase
-from graphql import graphql_sync, GraphQLObjectType
-from ariadne import make_executable_schema, ObjectType # or using graphql-core directly
-from neo4j_graphql_py import neo4j_graphql
+from graphql import graphql_sync, GraphQLObjectType, build_ast_schema, parse as parse_sdl
+from neo4j_graphql_shim import neo4j_graphql
 
 from langchain_community.graphs import Neo4jGraph
 from langchain_core.tools import tool
@@ -14,9 +13,10 @@ import json
 import logging
 
 from typing import List, Optional
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 #%%
 if not os.getenv( "NEO4J_URI", None ):
@@ -35,8 +35,12 @@ driver = GraphDatabase.driver( URI, auth=AUTH )
 #%%
 # Configure logging to capture output from the library
 logging.basicConfig()
-logging.getLogger("neo4j_graphql_py").setLevel(logging.DEBUG)
+logging.getLogger("neo4j_graphql_py").setLevel(logging.DEBUG)  # shim uses same logger name
 
+#%%
+def make_executable_schema(type_defs):
+    return build_ast_schema(parse_sdl(type_defs))
+    
 #%%
 # --- The GraphQL Schema ---
 # This strict schema defines exactly what the LLM is allowed to query.

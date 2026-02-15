@@ -3,11 +3,13 @@ from langgraph.prebuilt import create_react_agent
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
-from dotenv import load_dotenv
 import numexpr
 import math
 
-load_dotenv()
+from dotenv import load_dotenv, find_dotenv
+
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 #%%
 @tool

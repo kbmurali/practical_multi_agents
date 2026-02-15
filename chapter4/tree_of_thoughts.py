@@ -32,9 +32,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.runnables import RunnableConfig
 
 import json
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 #%%
 # -----------------------------
@@ -331,9 +332,9 @@ def stop_if_error(state: ToTState) -> str:
 def build_tot_graph():
     g = StateGraph(ToTState)
 
-    g.add_node("member_id", member_id_lookup_agent_node)
-    g.add_node("policy_id", policy_lookup_node)
-    g.add_node("policy_details", policy_details_node)
+    g.add_node("fetch_member_id", member_id_lookup_agent_node)
+    g.add_node("fetch_policy_id", policy_lookup_node)
+    g.add_node("fetch_policy_details", policy_details_node)
 
     g.add_node("generate_thoughts", generate_thoughts_node)
     g.add_node("evaluate_thoughts", evaluate_thoughts_node)
@@ -342,10 +343,10 @@ def build_tot_graph():
     g.add_node("compose_answer", final_response_node)
 
     # Linear info retrieval
-    g.set_entry_point("member_id")
-    g.add_conditional_edges("member_id", stop_if_error, {"stop": "compose_answer", "continue": "policy_id"})
-    g.add_conditional_edges("policy_id", stop_if_error, {"stop": "compose_answer", "continue": "policy_details"})
-    g.add_conditional_edges("policy_details", stop_if_error, {"stop": "compose_answer", "continue": "generate_thoughts"})
+    g.set_entry_point("fetch_member_id")
+    g.add_conditional_edges("fetch_member_id", stop_if_error, {"stop": "compose_answer", "continue": "fetch_policy_id"})
+    g.add_conditional_edges("fetch_policy_id", stop_if_error, {"stop": "compose_answer", "continue": "fetch_policy_details"})
+    g.add_conditional_edges("fetch_policy_details", stop_if_error, {"stop": "compose_answer", "continue": "generate_thoughts"})
 
     # ToT steps
     g.add_edge("generate_thoughts", "evaluate_thoughts")

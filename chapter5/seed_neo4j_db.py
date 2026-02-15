@@ -1,9 +1,10 @@
 #%%
 from neo4j import GraphDatabase
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 #%%
 def seed_database():

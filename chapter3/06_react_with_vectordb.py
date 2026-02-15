@@ -5,12 +5,14 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
-from dotenv import load_dotenv
 import numexpr
 import math
 import os
 
-load_dotenv()
+from dotenv import load_dotenv, find_dotenv
+
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 #%%
 # Embeddings for Chroma

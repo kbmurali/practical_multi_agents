@@ -12,9 +12,10 @@ from typing import List
 from langchain_openai import ChatOpenAI
 from langchain_core.runnables import RunnableConfig
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 # --------------------------------------------------------------------------------------
 # 1) Provider wrappers (treat each imported example as a "solution provider agent")

@@ -5,7 +5,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool, Tool
 from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
-from dotenv import load_dotenv
+
 import numexpr
 import math
 import os
@@ -17,7 +17,10 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.messages.utils import trim_messages, count_tokens_approximately
 import uuid
 
-load_dotenv()
+from dotenv import load_dotenv, find_dotenv
+
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 #%%
 # Embeddings for Chroma

@@ -36,9 +36,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.runnables import RunnableConfig
 
 import json
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 #%%
 # -----------------------------
@@ -398,7 +399,7 @@ def build_coa_graph():
     # Chain-of-Agents nodes (each produces a structured artifact)
     g.add_node("intake", member_id_lookup_agent_node)
     g.add_node("policy_lookup", policy_lookup_node)
-    g.add_node("policy_details", policy_details_node)
+    g.add_node("fetch_policy_details", policy_details_node)
     g.add_node("parse_policy", parse_policy_numbers_node)
     g.add_node("plan", planner_node)
     g.add_node("calculate", calculator_node)
@@ -408,8 +409,8 @@ def build_coa_graph():
     # Linear chain with early-stop on error
     g.set_entry_point("intake")
     g.add_conditional_edges("intake", stop_if_error, {"stop": "final", "continue": "policy_lookup"})
-    g.add_conditional_edges("policy_lookup", stop_if_error, {"stop": "final", "continue": "policy_details"})
-    g.add_conditional_edges("policy_details", stop_if_error, {"stop": "final", "continue": "parse_policy"})
+    g.add_conditional_edges("policy_lookup", stop_if_error, {"stop": "final", "continue": "fetch_policy_details"})
+    g.add_conditional_edges("fetch_policy_details", stop_if_error, {"stop": "final", "continue": "parse_policy"})
     g.add_conditional_edges("parse_policy", stop_if_error, {"stop": "final", "continue": "plan"})
 
     # Plan routes to calculate / clarify / answer

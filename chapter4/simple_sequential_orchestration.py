@@ -41,9 +41,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.runnables import RunnableConfig
 
 import json
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 #%%
 # -----------------------------
@@ -316,17 +317,17 @@ def build_sequential_graph():
     # Add Nodes
     g.add_node("intake", member_id_lookup_agent_node)
     g.add_node("policy_lookup", policy_lookup_node)
-    g.add_node("policy_details", policy_details_node)
+    g.add_node("fetch_policy_details", policy_details_node)
     g.add_node("query_evaluator", query_evaluator_node)
     g.add_node("calculator", calculator_node)
     g.add_node("final_response", final_response_node)
 
     # Add Edges (Linear Sequence)
-    # intake -> policy_lookup -> policy_details -> query_evaluator -> calculator -> final_response -> END
+    # intake -> policy_lookup -> fetch_policy_details -> query_evaluator -> calculator -> final_response -> END
     g.set_entry_point("intake")
     g.add_edge("intake", "policy_lookup")
-    g.add_edge("policy_lookup", "policy_details")
-    g.add_edge("policy_details", "query_evaluator")
+    g.add_edge("policy_lookup", "fetch_policy_details")
+    g.add_edge("fetch_policy_details", "query_evaluator")
     g.add_edge("query_evaluator", "calculator")
     g.add_edge("calculator", "final_response")
     g.add_edge("final_response", END)

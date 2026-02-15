@@ -3,10 +3,12 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
 
-from dotenv import load_dotenv
 import os
 
-load_dotenv()
+from dotenv import load_dotenv, find_dotenv
+
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 # Initialize MCP server
 mcp = FastMCP( 

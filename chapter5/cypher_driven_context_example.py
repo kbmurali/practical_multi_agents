@@ -6,9 +6,10 @@ from langchain_core.prompts import ChatPromptTemplate
 import json
 
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+# Walk up parent directories to find .env — works regardless of working directory
+load_dotenv(find_dotenv())
 
 #%%
 if not os.getenv( "NEO4J_URI", None ):
